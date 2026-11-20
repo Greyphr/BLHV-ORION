@@ -1,0 +1,30 @@
+{
+  "include": [
+    "orion",
+    "scripts",
+    "tests"
+  ],
+  "exclude": [
+    "**/__pycache__",
+    "out",
+    "data",
+    "backups"
+  ],
+  "pythonVersion": "3.12",
+  "typeCheckingMode": "basic",
+  "reportOptionalMemberAccess": "none",
+  "reportOptionalSubscript": "none",
+  "reportOptionalIterable": "none",
+  "reportOptionalCall": "none",
+  "reportOptionalOperand": "none",
+  "reportAttributeAccessIssue": "none",
+  "reportArgumentType": "none",
+  "reportGeneralTypeIssues": "none",
+  "reportIncompatibleMethodOverride": "none",
+  "reportReturnType": "none",
+  "reportAssignmentType": "none",
+  "reportCallIssue": "none",
+  "reportPossiblyUnboundVariable": "warning",
+  "reportOperatorIssue": "none",
+  "reportIndexIssue": "none"
+}

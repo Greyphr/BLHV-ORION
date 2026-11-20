@@ -1,0 +1,15 @@
+# 2.7+ is needed: its [voice] extra installs `davey`, the end-to-end voice encryption Discord now requires.
+# Without it the bot can join a channel and show "now playing" but nobody hears anything.
+discord.py[voice]>=2.7,<3
+# davey 0.2 changed how voice encryption starts: it needs prepare_transition()/execute_transition() calls that
+# discord.py 2.7.x never makes, so the session never becomes ready and the bot sends silent (unencrypted) audio.
+# 0.1.x does not need them. Remove this pin once discord.py supports davey 0.2.
+davey>=0.1.4,<0.2
+asyncpg>=0.29,<1
+aiohttp>=3.9,<4
+Pillow>=10.3,<13
+tzdata
+cryptography>=42,<48
+# unpinned on purpose: YouTube changes often and the bot upgrades it (in the background) on every start.
+# Set AUTO_UPDATE_YTDLP=0 to freeze whatever version the image was built with.
+yt-dlp[default]

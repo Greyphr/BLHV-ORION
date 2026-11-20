@@ -1,0 +1,7 @@
+.env
+__pycache__/
+out/
+backups/
+data/
+# cookie exports are session credentials
+*cookies*

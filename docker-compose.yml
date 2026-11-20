@@ -1,0 +1,65 @@
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: orion
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_DB: orion
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U orion -d orion"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  bot:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # the bot builds the connection string itself from these + DB_PASSWORD (from .env), percent-encoding the
+      # password, so any characters are safe in it
+      DB_HOST: db
+      DB_USER: orion
+      DB_NAME: orion
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "5"}      # logs can no longer fill the disk
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - ./assets:/app/assets
+      - ./data:/app/data      # giveaway reward encryption key (BACK THIS UP)
+
+  backup:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      PGPASSWORD: ${DB_PASSWORD}
+    volumes:
+      - ./backups:/backups
+    depends_on:
+      db:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        # a backup now, then one every 24 hours; backups older than 14 days are deleted
+        while true; do
+          f=/backups/orion-$$(date +%Y-%m-%d_%H%M).sql.gz
+          if pg_dump -h db -U orion -f /tmp/dump.sql orion && gzip -c /tmp/dump.sql > "$$f.tmp" && mv "$$f.tmp" "$$f"; then
+            echo "backup ok: $$f"
+          else
+            rm -f "$$f.tmp"
+            echo "BACKUP FAILED"
+          fi
+          rm -f /tmp/dump.sql
+          find /backups -name 'orion-*.sql.gz' -mtime +14 -delete
+          sleep 86400
+        done
+
+volumes:
+  pgdata:

@@ -1,0 +1,184 @@
+"""/ai: manage Orion's AI ticket handler (Sect Admin only): switch, settings, knowledge base, logs, test."""
+import logging
+
+import discord
+from discord import app_commands
+from discord.ext import commands
+
+from .. import ai, config
+from ..checks import require_admin
+from ..ticket_ai import AI_HELPER_KEY, LENGTHS, TONES, build_system_prompt, load_settings, parse_model_json, \
+    parse_setting, select_knowledge
+
+log = logging.getLogger("orion.ai.admin")
+
+SETTING_CHOICES = ["tone", "length", "personality", "confidence", "auto-close", "max-replies", "ping-staff",
+                   "model", "human-only-types"]
+KIND_ICON = {"reply": "💬", "escalate": "🙋", "close": "✅", "error": "⚠️", "skip": "⏭️", "handoff": "🤝"}
+
+
+class KnowledgeModal(discord.ui.Modal):
+    def __init__(self, cog: "AIAdmin", entry=None):
+        super().__init__(title="Edit knowledge entry" if entry else "Add knowledge entry")
+        self.cog, self.entry = cog, entry
+        self.t = discord.ui.TextInput(label="Title (what it is about)", max_length=100,
+                                      default=entry["title"] if entry else None)
+        self.c = discord.ui.TextInput(label="Approved answer / information", style=discord.TextStyle.paragraph,
+                                      max_length=1500, default=entry["content"] if entry else None)
+        self.add_item(self.t)
+        self.add_item(self.c)
+
+    async def on_submit(self, i: discord.Interaction):
+        db = self.cog.bot.db
+        if self.entry:
+            await db.kb_update(self.entry["id"], self.t.value.strip(), self.c.value.strip())
+            eid = self.entry["id"]
+        else:
+            eid = await db.kb_add(self.t.value.strip(), self.c.value.strip(), i.user.id)
+        await db.record_audit(i.user.id, "ai.kb.edit" if self.entry else "ai.kb.add", "ai_knowledge", eid,
+                              title=self.t.value.strip())
+        await i.response.send_message(f"✅ Knowledge entry **#{eid}** saved.", ephemeral=True)
+
+
+class AIAdmin(commands.GroupCog, name="ai", description="Orion's AI ticket handler (Sect Admin)"):
+    kb = app_commands.Group(name="kb", description="The approved knowledge base the AI may answer from")
+
+    def __init__(self, bot):
+        self.bot = bot
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return await require_admin(interaction)
+
+    @property
+    def db(self):
+        return self.bot.db
+
+    # ------------------------------------------------------------- status
+    @app_commands.command(name="status", description="Show the AI helper's state and settings")
+    async def status(self, i: discord.Interaction):
+        s = load_settings(self.db.get)
+        stats = await self.db.ai_stats(7)
+        kb_n = len(await self.db.kb_list(True))
+        e = discord.Embed(title="🤖 AI ticket handler", color=config.COLOR_MAIN,
+                          description=f"**{'✅ ON' if s.enabled else '❌ OFF'}** · experimental · "
+                                      f"{'API key set' if ai.is_configured() else '⚠️ no `AI_API_KEY` in `.env`'}")
+        e.add_field(name="Model", value=f"`{config.AI_PROVIDER}` · `{s.model or config.AI_MODEL}`", inline=False)
+        e.add_field(name="Tone / length", value=f"{s.tone} / {s.length} (max {s.max_chars} chars)", inline=True)
+        e.add_field(name="Confidence needed", value=f"{s.confidence:.0%}", inline=True)
+        e.add_field(name="Auto-close routine tickets", value="on" if s.auto_close else "off", inline=True)
+        e.add_field(name="Max AI replies per ticket", value=str(s.max_replies), inline=True)
+        e.add_field(name="Ping staff on handover", value="yes" if s.ping_staff else "no", inline=True)
+        e.add_field(name="Knowledge entries", value=str(kb_n), inline=True)
+        e.add_field(name="Human-only ticket types (AI never answers)", value=", ".join(sorted(s.human_only)) or "none",
+                    inline=False)
+        if s.personality:
+            e.add_field(name="Personality notes", value=s.personality[:300], inline=False)
+        e.add_field(name="Last 7 days", inline=False,
+                    value=" · ".join(f"{KIND_ICON.get(k, '')} {k}: {n}" for k, n in sorted(stats.items())) or "no activity")
+        await i.response.send_message(embed=e, ephemeral=True)
+
+    @app_commands.command(name="switch", description="Turn the AI helper on or off for every ticket")
+    @app_commands.choices(state=[app_commands.Choice(name="on", value="on"), app_commands.Choice(name="off", value="off")])
+    async def switch(self, i: discord.Interaction, state: app_commands.Choice[str]):
+        on = state.value == "on"
+        if on and not ai.is_configured():
+            return await i.response.send_message("⚠️ Add `AI_API_KEY` to `.env` and restart the bot first.", ephemeral=True)
+        await self.db.set(AI_HELPER_KEY, on)
+        await self.db.record_audit(i.user.id, "ai.switch", "config", AI_HELPER_KEY, enabled=on)
+        await i.response.send_message("✅ AI helper is now **ON**. New tickets get first-line help; tickets work normally "
+                                      "if it fails." if on else "⏸️ AI helper is now **OFF**. Tickets work normally without it.",
+                                      ephemeral=True)
+
+    @app_commands.command(name="set", description="Change an AI setting")
+    @app_commands.describe(setting="What to change", value="New value (tone: %s; length: %s; on/off; 0-100%%; ...)"
+                           % ("/".join(TONES), "/".join(LENGTHS)))
+    @app_commands.choices(setting=[app_commands.Choice(name=n, value=n) for n in SETTING_CHOICES])
+    async def set_(self, i: discord.Interaction, setting: app_commands.Choice[str], value: str):
+        try:
+            key, parsed = parse_setting(setting.value, value)
+        except ValueError as e:
+            return await i.response.send_message(f"⚠️ {e}", ephemeral=True)
+        await self.db.set(key, parsed)
+        await self.db.record_audit(i.user.id, "ai.set", "config", key, value=parsed)
+        await i.response.send_message(f"✅ **{setting.value}** is now `{parsed}`.", ephemeral=True)
+
+    # ---------------------------------------------------------- knowledge base
+    @kb.command(name="add", description="Add an approved fact or answer")
+    async def kb_add(self, i: discord.Interaction):
+        await i.response.send_modal(KnowledgeModal(self))
+
+    @kb.command(name="edit", description="Edit a knowledge entry")
+    async def kb_edit(self, i: discord.Interaction, id: int):
+        e = await self.db.kb_get(id)
+        if e is None:
+            return await i.response.send_message("No entry with that number.", ephemeral=True)
+        await i.response.send_modal(KnowledgeModal(self, e))
+
+    @kb.command(name="list", description="List the knowledge entries")
+    async def kb_list(self, i: discord.Interaction):
+        rows = await self.db.kb_list()
+        if not rows:
+            return await i.response.send_message("The knowledge base is empty. Add facts with `/ai kb add`: the AI only "
+                                                 "answers from what is written here.", ephemeral=True)
+        lines = [f"`#{r['id']}` {'✅' if r['enabled'] else '⏸️'} **{r['title']}**: {r['content'][:80].replace(chr(10), ' ')}…"
+                 for r in rows]
+        await i.response.send_message("\n".join(lines)[:1900], ephemeral=True)
+
+    @kb.command(name="toggle", description="Enable or disable an entry without deleting it")
+    async def kb_toggle(self, i: discord.Interaction, id: int, enabled: bool):
+        ok = await self.db.kb_set_enabled(id, enabled)
+        if ok:
+            await self.db.record_audit(i.user.id, "ai.kb.toggle", "ai_knowledge", id, enabled=enabled)
+        await i.response.send_message("✅ Updated." if ok else "No entry with that number.", ephemeral=True)
+
+    @kb.command(name="remove", description="Delete a knowledge entry")
+    async def kb_remove(self, i: discord.Interaction, id: int):
+        ok = await self.db.kb_remove(id)
+        if ok:
+            await self.db.record_audit(i.user.id, "ai.kb.remove", "ai_knowledge", id)
+        await i.response.send_message("🗑️ Removed." if ok else "No entry with that number.", ephemeral=True)
+
+    # -------------------------------------------------------------- logs / test
+    @app_commands.command(name="logs", description="Recent AI activity (optionally for one ticket)")
+    async def logs(self, i: discord.Interaction, ticket: app_commands.Range[int, 1, 10_000_000] | None = None):
+        rows = await self.db.ai_logs(ticket, 15)
+        if not rows:
+            return await i.response.send_message("No AI activity recorded yet.", ephemeral=True)
+        lines = []
+        for r in rows:
+            conf = f" {r['confidence']:.0%}" if r["confidence"] is not None else ""
+            lines.append(f"{KIND_ICON.get(r['kind'], '•')} <t:{int(r['created_at'].timestamp())}:R> "
+                         f"ticket #{r['ticket_id'] or '—'} **{r['kind']}**{conf}"
+                         f"{' · ' + r['reason'] if r['reason'] else ''}"
+                         f"{chr(10) + '> ' + r['summary'][:160] if r['summary'] else ''}")
+        await i.response.send_message("\n".join(lines)[:1950], ephemeral=True,
+                                      allowed_mentions=discord.AllowedMentions.none())
+
+    @app_commands.command(name="test", description="Try a question exactly as a member in a General Support ticket")
+    async def test(self, i: discord.Interaction, question: app_commands.Range[str, 1, 500]):
+        if not ai.is_configured():
+            return await i.response.send_message("❌ No `AI_API_KEY` in `.env`.", ephemeral=True)
+        await i.response.defer(ephemeral=True, thinking=True)
+        s = load_settings(self.db.get)
+        kb = select_knowledge(await self.db.kb_list(True), question)
+        system = build_system_prompt(s, type_name="General Support", type_names=["General Support", "Other"], kb=kb,
+                                     guild_name=i.guild.name if i.guild else "Blue Heaven")
+        from ..ticket_ai import build_user_message
+        try:
+            text = await ai.complete(system, build_user_message([{"q": "Question", "a": question}], []), max_tokens=700,
+                                     model=s.model or None, json_mode=True, raw=True)
+        except ai.AIError as e:
+            return await i.followup.send(f"❌ The AI service failed: {e}", ephemeral=True)
+        raw = parse_model_json(text)
+        if raw is None:
+            return await i.followup.send("⚠️ The model's answer wasn't readable JSON:\n>>> " + text[:900], ephemeral=True)
+        used = ", ".join(e["title"] for e in kb) or "none"
+        await i.followup.send(
+            f">>> {ai.clean_reply(raw['reply'], s.max_chars)}\n\n"
+            f"confidence **{raw['confidence']:.0%}** (needs {s.confidence:.0%}) · human needed: **{raw['needs_human']}** · "
+            f"sensitive: **{raw['sensitive']}**\nknowledge used: {used}", ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none())
+
+
+async def setup(bot):
+    await bot.add_cog(AIAdmin(bot))

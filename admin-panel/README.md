@@ -23,17 +23,21 @@ A standalone admin web panel and REST API for Orion. It runs in **its own Docker
 
 ## Setup
 
-### 1. Create the Discord application
+### 1. Use your existing Orion Discord application
 
-1. Open https://discord.com/developers/applications and create an application.
+You do **not** need to create a new app. Reuse the same application that owns the Orion bot:
+
+1. Open https://discord.com/developers/applications and select your existing **Orion** application.
 2. Under **OAuth2 → General**, add this redirect URI exactly:
 
    ```text
    http://127.0.0.1:8081/auth/callback
    ```
 
-3. Copy the **Client ID** and generate a **Client Secret**.
-4. The panel requests `identify`, `guilds`, and `guilds.members.read`.
+3. Copy the application's **Client ID** (shown at the top of the page) and its **Client Secret** (under OAuth2 → General).
+4. Put those two values into `admin.env` as `DISCORD_CLIENT_ID` and `DISCORD_CLIENT_SECRET`.
+
+The panel never receives the bot token — it only uses these OAuth2 application credentials so Discord can identify who is signing in. The panel requests `identify`, `guilds`, and `guilds.members.read`.
 
 ### 2. Configure env
 

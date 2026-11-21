@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Orion Admin</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <aside class="sidebar">
+    <div class="brand"><span class="brand-mark">O</span><span>Orion Admin</span></div>
+    <nav id="nav">
+      <a href="#overview" data-section="overview">Overview</a>
+      <a href="#database" data-section="database">Database</a>
+      <a href="#config" data-section="config">Config</a>
+      <a href="#migrations" data-section="migrations">Migrations</a>
+      <a href="#containers" data-section="containers">Containers</a>
+      <a href="#backups" data-section="backups">Backups</a>
+      <a href="#api" data-section="api">API</a>
+    </nav>
+    <div class="sidebar-foot">
+      <div id="identity" class="identity">Loading…</div>
+      <button id="logout" class="ghost">Sign out</button>
+    </div>
+  </aside>
+
+  <main>
+    <header class="topbar">
+      <h1 id="title">Overview</h1>
+      <span id="badge" class="badge">Connecting…</span>
+    </header>
+    <div id="content" class="content"><p class="muted">Loading…</p></div>
+  </main>
+
+  <div id="modal" class="modal hidden">
+    <div class="modal-card">
+      <div class="modal-head"><h2 id="modal-title">Edit</h2><button id="modal-close" class="ghost">×</button></div>
+      <div id="modal-body"></div>
+      <div class="modal-actions">
+        <button id="modal-cancel" class="ghost">Cancel</button>
+        <button id="modal-save" class="primary">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

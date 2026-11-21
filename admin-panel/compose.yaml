@@ -1,0 +1,41 @@
+# Standalone admin service. Copy this folder to C:\Orion-Production\admin-panel,
+# place admin.env in C:\Orion-Production, then run:
+#   docker compose -f compose.yaml up -d
+#
+# It joins the existing production network and backup volume without modifying
+# the bot stack. WUD is explicitly told not to watch this container.
+name: orion
+
+services:
+  admin:
+    build: .
+    image: orion-admin:local
+    container_name: orion-admin
+    restart: unless-stopped
+    env_file:
+      - path: ../admin.env
+        required: false
+    ports:
+      - "127.0.0.1:${ADMIN_PORT:-8081}:8080"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - orion_pgbackups:/backups:ro
+    networks:
+      - orion_internal
+    labels:
+      - wud.watch=false
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+networks:
+  orion_internal:
+    name: orion_orion_internal
+    external: true
+
+volumes:
+  orion_pgbackups:
+    name: orion_pgbackups
+    external: true

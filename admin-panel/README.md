@@ -51,7 +51,7 @@ This folder contains its own `compose.yaml`. Copy the whole folder next to the p
 Copy-Item -Recurse . C:\Orion-Production\admin-panel
 ```
 
-The compose file joins the existing `orion_orion_internal` network and `orion_pgbackups` volume, and publishes only on `127.0.0.1:8081`. Start it from the copied folder:
+The compose file uses its own project name (`orion-admin`), so updates to the main `orion` stack can never remove it as an orphan. It joins the existing `orion_orion_internal` network and `orion_pgbackups` volume, and publishes only on `127.0.0.1:8081`. Start it from the copied folder:
 
 ```powershell
 cd C:\Orion-Production\admin-panel

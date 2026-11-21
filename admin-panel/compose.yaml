@@ -4,7 +4,7 @@
 #
 # It joins the existing production network and backup volume without modifying
 # the bot stack. WUD is explicitly told not to watch this container.
-name: orion
+name: orion-admin
 
 services:
   admin:

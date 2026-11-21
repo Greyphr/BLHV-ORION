@@ -384,7 +384,6 @@
 
   function bindDashForms(c) {
     const on = (sel, fn) => { const el = $(sel); if (el) el.onclick = fn; };
-    const collect = (prefix, keys) => Object.fromEntries(keys.map((k) => [k, $(`#${prefix}${k}`)?.value ?? '']));
     const setMany = async (values) => { try { await botAction('config.set_many', { values }); } catch (e) { alert(e.message); } };
 
     on('#tk-save', () => setMany({
@@ -399,7 +398,13 @@
       welcome_layout: jparse($('#cfg-welcome_layout').value, {}),
       welcome_enabled: $('#cfg-welcome_enabled').checked,
     }));
-    on('#dm-save', () => setMany(collect('cfg-', ['dm_title', 'dm_text', 'dm_footer', 'dm_color', 'dm_banner_position'])));
+    on('#dm-save', () => setMany({
+      dm_title: $('#cfg-dm_title').value,
+      dm_text: $('#cfg-dm_text').value,
+      dm_footer: $('#cfg-dm_footer').value,
+      dm_color: $('#cfg-dm_color').value.trim(),
+      dm_banner_position: $('#cfg-dm_banner_position').value,
+    }));
     on('#channels-save', () => setMany(Object.fromEntries(['welcome_channel_id', 'leave_channel_id', 'levelup_channel_id', 'alert_channel_id']
       .map((k) => [k, num($(`#cfg-${k}`).value)]))));
     on('#staff-save', () => setMany({ staff_role_ids: $('#staff-roles').value.split(',').map((s) => num(s)).filter(Boolean) }));

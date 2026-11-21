@@ -17,7 +17,7 @@ from uuid import UUID
 from aiohttp import web
 
 from . import config as bot_config
-from . import roles
+from . import levels, roles
 from .services import cultivation
 
 log = logging.getLogger("orion.bot_rpc")
@@ -55,6 +55,21 @@ def redact(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [redact(item) for item in value]
     return value
+
+
+NUMERIC_CONFIG_KEYS = frozenset({"dm_color", "ticket_color"})
+
+
+def coerce_config_value(key: str, value: Any) -> Any:
+    """Store the same types the Discord /admin editor stores (HTML inputs are strings)."""
+    if key not in NUMERIC_CONFIG_KEYS:
+        return value
+    if value in (None, ""):
+        return ""
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{key} must be a number or blank") from exc
 
 
 class BotRPCServer:
@@ -276,7 +291,7 @@ class BotRPCServer:
                 raise ValueError(f"Config key is not editable from the web panel: {key}")
             if key == "welcome_layout" and not isinstance(value, dict):
                 raise ValueError("welcome_layout must be a JSON object")
-            await self.bot.db.set(key, value)
+            await self.bot.db.set(key, coerce_config_value(key, value))
             changed.append(key)
             xp_keys = xp_keys or key.startswith("rule_")
         if xp_keys:
@@ -304,18 +319,31 @@ class BotRPCServer:
         amount = int(params.get("amount", 0))
         if mode not in ("add", "remove", "set", "reset"):
             raise ValueError("mode must be add, remove, set or reset")
-        change = await cultivation.adjust_member_xp(self.bot.db, actor_id, member_id, mode, amount)
+        if mode == "reset":
+            # reset_user() deletes the row, unlike adjust_xp() which only has add/remove/set.
+            row = await self.bot.db.get_user(member_id)
+            old_xp = int(row["xp"]) if row else 0
+            await self.bot.db.reset_user(member_id)
+            await self.bot.db.log_progression(
+                member_id, old_xp, 0, levels.level_from_xp(old_xp), levels.level_from_xp(0), "admin", actor_id)
+            change = cultivation.XpChange(member_id, old_xp, 0,
+                                          levels.level_from_xp(old_xp), levels.level_from_xp(0))
+        else:
+            change = await cultivation.adjust_member_xp(self.bot.db, actor_id, member_id, mode, amount)
         target = self._guild().get_member(member_id)
         role_changed = False
+        warning = None
         if target is not None:
-            from . import levels
-
-            role_changed = await roles.sync_member_role(
-                target, levels.level_from_xp(change.new_xp), strict=True
-            )
+            try:
+                role_changed = await roles.sync_member_role(
+                    target, levels.level_from_xp(change.new_xp), strict=True
+                )
+            except roles.RoleSyncError as exc:
+                warning = str(exc)
         return {
             "member_id": member_id, "old_xp": change.old_xp, "new_xp": change.new_xp,
-            "old_level": change.old_level, "new_level": change.new_level, "role_changed": role_changed,
+            "old_level": change.old_level, "new_level": change.new_level,
+            "role_changed": role_changed, "warning": warning,
         }
 
     async def _xp_resync_roles(self, params: dict[str, Any], member: Any, actor_id: int) -> dict[str, Any]:
@@ -340,8 +368,8 @@ class BotRPCServer:
         if cog is None:
             raise RuntimeError("Tickets cog is not loaded")
         await cog.reload_types()
-        await self._refresh_panel()
-        return {"reloaded": True}
+        note = await cog.refresh_panel()
+        return {"reloaded": True, "note": note}
 
     async def _tickets_type_create(self, params: dict[str, Any], member: Any, actor_id: int) -> dict[str, Any]:
         allowed = {"emoji", "description", "questions", "staff_role_ids", "category_id", "ping_role_ids"}
@@ -351,8 +379,9 @@ class BotRPCServer:
         return {"type_id": type_id}
 
     async def _tickets_type_update(self, params: dict[str, Any], member: Any, actor_id: int) -> dict[str, Any]:
-        type_id = int(params.pop("type_id"))
-        await self.bot.db.tt_update(type_id, **params)
+        fields = dict(params)
+        type_id = int(fields.pop("type_id"))
+        await self.bot.db.tt_update(type_id, **fields)
         await self._tickets_types_reload({}, member, actor_id)
         return {"type_id": type_id}
 
@@ -469,18 +498,23 @@ class BotRPCServer:
         return Draft.from_dict(params)
 
     async def _announcement_publish(self, params: dict[str, Any], member: Any, actor_id: int) -> dict[str, Any]:
-        from .cogs.announce import build_embeds, link_view
+        from .cogs.announce import build_embeds, link_view, load_assets, mention_parts
 
         channel = self._channel(int(params["channel_id"]))
         if channel is None:
             raise ValueError("Announcement channel not found")
         draft = self._draft(params.get("draft") or {})
-        embeds = build_embeds(draft)
+        files, thumb, banner, top = await load_assets(self.bot.db, draft)
+        mentions = [m for m in (params.get("mentions") or []) if isinstance(m, dict)]
+        ping_text, allowed = mention_parts(mentions, str(params.get("ping") or "none"))
+        content = " ".join(text for text in (ping_text, params.get("message") or None) if text) or None
+        embeds = build_embeds(draft, thumb, banner, top)
         view = link_view(draft)
-        message = await channel.send(
-            content=(params.get("message") or None), embeds=embeds, view=view,
-            allowed_mentions=None,
-        )
+        kwargs: dict[str, Any] = {"content": content, "embeds": embeds, "view": view,
+                                  "allowed_mentions": allowed}
+        if files:
+            kwargs["files"] = files
+        message = await channel.send(**kwargs)
         await self.bot.db.save_announcement(channel.id, message.id, actor_id, draft.title,
                                             draft.to_dict(), [], False)
         await self.bot.db.record_audit(actor_id, "announce.publish", "announcement", message.id,

@@ -126,6 +126,12 @@ services:
       # No public/private dashboard or API is needed on the hosting machine.
       WUD_SERVER_ENABLED: "false"
 
+      # WUD 9+ refuses to start without an administrator. These are local-only
+      # bootstrap credentials; no WUD port is published.
+      WUD_AUTH_ADMIN_USER: ${WUD_AUTH_ADMIN_USER:?Set WUD_AUTH_ADMIN_USER in the deployment .env file}
+      WUD_AUTH_ADMIN_PASSWORD: ${WUD_AUTH_ADMIN_PASSWORD:?Set WUD_AUTH_ADMIN_PASSWORD in the deployment .env file}
+      WUD_AUTH_SESSION_SECRET: ${WUD_AUTH_SESSION_SECRET:?Set WUD_AUTH_SESSION_SECRET in the deployment .env file}
+
       # Strict opt-in: only containers labelled wud.watch=true are discovered.
       WUD_WATCHER_LOCAL_SOCKET: /var/run/docker.sock
       WUD_WATCHER_LOCAL_WATCHBYDEFAULT: "false"

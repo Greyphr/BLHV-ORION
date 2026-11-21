@@ -27,7 +27,9 @@ class HealthServer:
     async def _healthz(self, _request: web.Request) -> web.Response:
         db = getattr(self.bot, "db", None)
         pool = getattr(db, "pool", None)
-        database_up = pool is not None and not pool.is_closed()
+        # asyncpg's Pool exposes a private ``_closed`` flag rather than a
+        # public is_closed() method, so check that instead of calling one.
+        database_up = pool is not None and not getattr(pool, "_closed", False)
         discord_ready = self.bot.is_ready() and not self.bot.is_closed()
         ready = bool(database_up and discord_ready)
 

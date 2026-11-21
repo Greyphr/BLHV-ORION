@@ -203,7 +203,12 @@ class BotRPCServer:
         return self.bot.get_guild(bot_config.GUILD_ID)
 
     def _cog(self, name: str) -> Any:
-        return self.bot.get_cog(name)
+        cog = self.bot.get_cog(name)
+        if cog is not None:
+            return cog
+        # GroupCogs are registered under their group name ("ticket", "poll", ...),
+        # which is lower-case even though the Python class is Tickets, Polls, etc.
+        return next((c for n, c in self.bot.cogs.items() if n.lower() == name.lower()), None)
 
     def _channel(self, channel_id: int) -> Any:
         guild = self._guild()
@@ -319,19 +324,19 @@ class BotRPCServer:
 
     # ----------------------------------------------------------------- tickets
     async def _tickets_setup(self, params: dict[str, Any], member: Any, actor_id: int) -> dict[str, Any]:
-        cog = self._cog("Tickets")
+        cog = self._cog("ticket")
         if cog is None:
             raise RuntimeError("Tickets cog is not loaded")
         return {"message": await cog.setup_tickets(self._guild())}
 
     async def _tickets_panel_refresh(self, params: dict[str, Any], member: Any, actor_id: int) -> dict[str, Any]:
-        cog = self._cog("Tickets")
+        cog = self._cog("ticket")
         if cog is None:
             raise RuntimeError("Tickets cog is not loaded")
         return {"message": await cog.refresh_panel() or "Panel refreshed."}
 
     async def _tickets_types_reload(self, params: dict[str, Any], member: Any, actor_id: int) -> dict[str, Any]:
-        cog = self._cog("Tickets")
+        cog = self._cog("ticket")
         if cog is None:
             raise RuntimeError("Tickets cog is not loaded")
         await cog.reload_types()
@@ -358,7 +363,7 @@ class BotRPCServer:
         return {"type_id": type_id}
 
     async def _tickets_banner_set(self, params: dict[str, Any], member: Any, actor_id: int) -> dict[str, Any]:
-        cog = self._cog("Tickets")
+        cog = self._cog("ticket")
         if cog is None:
             raise RuntimeError("Tickets cog is not loaded")
         which = str(params.get("which", "panel"))
@@ -368,7 +373,7 @@ class BotRPCServer:
         return {"message": message}
 
     async def _tickets_stats(self, params: dict[str, Any], member: Any, actor_id: int) -> dict[str, Any]:
-        cog = self._cog("Tickets")
+        cog = self._cog("ticket")
         if cog is None:
             raise RuntimeError("Tickets cog is not loaded")
         days = min(max(int(params.get("days", 30)), 1), 365)
@@ -388,7 +393,7 @@ class BotRPCServer:
     async def _giveaway_create(self, params: dict[str, Any], member: Any, actor_id: int) -> dict[str, Any]:
         from .giveaway_ui import GiveawayDraft, RewardDraft
 
-        cog = self._cog("Giveaways")
+        cog = self._cog("giveaway")
         if cog is None:
             raise RuntimeError("Giveaways cog is not loaded")
         rewards = [RewardDraft(**reward) for reward in params.get("rewards", [])]
@@ -404,19 +409,19 @@ class BotRPCServer:
         return {"giveaway_id": gid, "message_id": message.id, "jump_url": message.jump_url}
 
     async def _giveaway_end(self, params: dict[str, Any], member: Any, actor_id: int) -> dict[str, Any]:
-        cog = self._cog("Giveaways")
+        cog = self._cog("giveaway")
         if cog is None:
             raise RuntimeError("Giveaways cog is not loaded")
         return {"ended": await cog.end_giveaway(int(params["giveaway_id"]), actor_id, early=True)}
 
     async def _giveaway_cancel(self, params: dict[str, Any], member: Any, actor_id: int) -> dict[str, Any]:
-        cog = self._cog("Giveaways")
+        cog = self._cog("giveaway")
         if cog is None:
             raise RuntimeError("Giveaways cog is not loaded")
         return {"cancelled": await cog.cancel_giveaway(int(params["giveaway_id"]), actor_id)}
 
     async def _giveaway_reroll(self, params: dict[str, Any], member: Any, actor_id: int) -> dict[str, Any]:
-        cog = self._cog("Giveaways")
+        cog = self._cog("giveaway")
         if cog is None:
             raise RuntimeError("Giveaways cog is not loaded")
         ok, message = await cog.reroll(int(params["giveaway_id"]), int(params["reward_id"]), actor_id)
@@ -424,7 +429,7 @@ class BotRPCServer:
 
     # -------------------------------------------------------------------- polls
     async def _poll_create(self, params: dict[str, Any], member: Any, actor_id: int) -> dict[str, Any]:
-        cog = self._cog("Polls")
+        cog = self._cog("poll")
         if cog is None:
             raise RuntimeError("Polls cog is not loaded")
         channel = self._channel(int(params["channel_id"]))
@@ -445,13 +450,13 @@ class BotRPCServer:
         return {"poll_id": poll_id, "message_id": message.id, "jump_url": message.jump_url, "note": note}
 
     async def _poll_finish(self, params: dict[str, Any], member: Any, actor_id: int) -> dict[str, Any]:
-        cog = self._cog("Polls")
+        cog = self._cog("poll")
         if cog is None:
             raise RuntimeError("Polls cog is not loaded")
         return {"finished": await cog.finish(int(params["poll_id"]))}
 
     async def _poll_delete(self, params: dict[str, Any], member: Any, actor_id: int) -> dict[str, Any]:
-        cog = self._cog("Polls")
+        cog = self._cog("poll")
         if cog is None:
             raise RuntimeError("Polls cog is not loaded")
         await cog.delete_poll(int(params["poll_id"]))

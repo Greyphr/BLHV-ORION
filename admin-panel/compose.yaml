@@ -17,6 +17,10 @@ services:
         required: false
     ports:
       - "127.0.0.1:${ADMIN_PORT:-8081}:8080"
+    # The Docker socket on the host is owned by root:root with mode 660.
+    # Add that group so the non-root app user can read/control containers.
+    group_add:
+      - "0"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - orion_pgbackups:/backups:ro

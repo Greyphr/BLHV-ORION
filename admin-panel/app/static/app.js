@@ -541,7 +541,7 @@
   }
 
   const renderers = {
-    overview: renderOverview, database: renderDatabase, config: renderConfig,
+    overview: renderOverview, discord: renderDiscordAdmin, database: renderDatabase, config: renderConfig,
     migrations: renderMigrations, containers: renderContainers, backups: renderBackups, api: renderApi
   };
 

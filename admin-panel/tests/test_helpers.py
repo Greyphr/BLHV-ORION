@@ -1,4 +1,5 @@
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 from app.database import coerce, jsonable, quote_ident
@@ -59,3 +60,11 @@ def test_permissions_follow_discord_identity():
     assert permissions_for("2", {"10"}, cfg) == frozenset({"read", "write", "control"})
     assert permissions_for("3", {"20"}, cfg) == frozenset({"read"})
     assert permissions_for("4", set(), cfg) == frozenset()
+
+
+def test_discord_nav_has_a_renderer():
+    static = Path(__file__).resolve().parents[1] / "app" / "static"
+    html = (static / "index.html").read_text(encoding="utf-8")
+    js = (static / "app.js").read_text(encoding="utf-8")
+    assert 'data-section="discord"' in html
+    assert "discord: renderDiscordAdmin" in js

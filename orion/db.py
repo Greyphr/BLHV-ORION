@@ -1,3 +1,4 @@
+import copy
 import json
 import logging
 import random
@@ -5,14 +6,15 @@ from typing import NamedTuple, Optional
 
 import asyncpg
 
-from . import config
-from . import migrations
+from . import config, migrations
+from .announce_templates import BUILTIN_TEMPLATES
 from .achievement_db import AchievementStore
 from .ai_db import AiStore
 from .audit_db import AuditStore
 from .event_db import EventStore
 from .giveaway_db import GiveawayStore
 from .keys_db import KeyStore
+from .mod_db import ModStore
 from .poll_db import PollStore
 from .ticket_db import TicketStore
 from .timeutil import day_key, month_key, week_key
@@ -33,7 +35,7 @@ class Award(NamedTuple):
     bonus: int = 0
 
 
-class Database(AuditStore, AiStore, AchievementStore, EventStore, GiveawayStore, PollStore, TicketStore, KeyStore):
+class Database(AuditStore, ModStore, AiStore, AchievementStore, EventStore, GiveawayStore, PollStore, TicketStore, KeyStore):
     def __init__(self, dsn: str):
         self.dsn = dsn
         self.pool: Optional[asyncpg.Pool] = None
@@ -234,13 +236,19 @@ class Database(AuditStore, AiStore, AchievementStore, EventStore, GiveawayStore,
             name.strip().lower(), data, author_id)
 
     async def get_template(self, name: str):
-        return await self.pool.fetchval(
-            "SELECT data FROM announcement_templates WHERE name=$1", name.strip().lower())
+        """A saved template, else the built-in one of that name (saved ones win, so staff can override a built-in)."""
+        key = name.strip().lower()
+        row = await self.pool.fetchrow("SELECT data FROM announcement_templates WHERE name=$1", key)
+        if row:
+            return row["data"]
+        return copy.deepcopy(BUILTIN_TEMPLATES.get(key))
 
     async def list_templates(self) -> list[str]:
-        return [r["name"] for r in await self.pool.fetch("SELECT name FROM announcement_templates ORDER BY name")]
+        saved = [r["name"] for r in await self.pool.fetch("SELECT name FROM announcement_templates")]
+        return sorted(set(saved) | set(BUILTIN_TEMPLATES))
 
     async def delete_template(self, name: str) -> bool:
+        """Deletes a saved template. Built-ins can't be deleted (deleting an override restores the built-in)."""
         return (await self.pool.execute(
             "DELETE FROM announcement_templates WHERE name=$1", name.strip().lower())) == "DELETE 1"
 
@@ -256,6 +264,45 @@ class Database(AuditStore, AiStore, AchievementStore, EventStore, GiveawayStore,
 
     async def get_announcement(self, message_id: int):
         return await self.pool.fetchrow("SELECT * FROM announcements WHERE message_id=$1", message_id)
+
+    async def delete_announcement_record(self, message_id: int) -> bool:
+        return (await self.pool.execute("DELETE FROM announcements WHERE message_id=$1", message_id)).endswith("1")
+
+    # ---- scheduled announcements
+    async def announce_schedule_add(self, channel_id, author_id, data, mentions, ping, publish_at) -> int:
+        return await self.pool.fetchval(
+            "INSERT INTO scheduled_announcements(channel_id, author_id, data, mentions, ping_mode, publish_at) "
+            "VALUES($1,$2,$3,$4,$5,$6) RETURNING id", channel_id, author_id, data, mentions, ping, publish_at)
+
+    async def announce_claim_due(self, limit: int = 5):
+        """Atomically take the pending announcements that are due (safe even if two processes ever ran)."""
+        return await self.pool.fetch(
+            "UPDATE scheduled_announcements SET status='publishing', attempts = attempts + 1 WHERE id IN ("
+            "  SELECT id FROM scheduled_announcements WHERE status='pending' AND publish_at <= now() "
+            "  ORDER BY publish_at LIMIT $1 FOR UPDATE SKIP LOCKED) RETURNING *", limit)
+
+    async def announce_finish(self, sid: int, status: str, *, message_id=None, error=None, retry_at=None):
+        if retry_at is not None:
+            await self.pool.execute("UPDATE scheduled_announcements SET status='pending', publish_at=$2, error=$3 WHERE id=$1",
+                                    sid, retry_at, error)
+        else:
+            await self.pool.execute("UPDATE scheduled_announcements SET status=$2, message_id=$3, error=$4 WHERE id=$1",
+                                    sid, status, message_id, error)
+
+    async def announce_release_stuck(self) -> int:
+        """After a restart: anything left 'publishing' goes back to pending."""
+        res = await self.pool.execute("UPDATE scheduled_announcements SET status='pending' WHERE status='publishing'")
+        return int(res.split()[-1])
+
+    async def announce_scheduled_list(self, limit: int = 15):
+        return await self.pool.fetch(
+            "SELECT * FROM scheduled_announcements WHERE status IN ('pending','failed') "
+            "ORDER BY (status='pending') DESC, publish_at LIMIT $1", limit)
+
+    async def announce_cancel_scheduled(self, sid: int) -> bool:
+        return (await self.pool.execute(
+            "UPDATE scheduled_announcements SET status='cancelled' WHERE id=$1 AND status IN ('pending','failed')",
+            sid)).endswith("1")
 
     async def recent_announcements(self, limit: int = 10):
         return await self.pool.fetch("SELECT * FROM announcements ORDER BY published_at DESC LIMIT $1", limit)

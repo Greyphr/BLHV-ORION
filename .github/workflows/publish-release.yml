@@ -1,0 +1,91 @@
+name: Publish Orion release image
+
+# Production deployment happens only on the hosting machine, and only from
+# published GitHub Releases. Ordinary pushes and pull requests never deploy.
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read       # checkout source
+  packages: write      # push to GHCR
+  actions: write       # GHA-backed build cache
+
+concurrency:
+  group: publish-release-${{ github.event.release.tag_name }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Build and publish GHCR image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the released source
+        uses: actions/checkout@v4
+
+      - name: Derive image owner and semantic version
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#v}"
+
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Release tag '$tag' is not a numeric semantic version (expected v1.2.3 or 1.2.3)." >&2
+            exit 1
+          fi
+
+          echo "owner=$owner" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Publishing ghcr.io/$owner/orion:$version and :latest"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate image tags and OCI labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ steps.release.outputs.owner }}/orion
+          tags: |
+            type=raw,value=${{ steps.release.outputs.version }}
+            type=raw,value=v${{ steps.release.outputs.version }}
+            type=raw,value=latest
+          labels: |
+            org.opencontainers.image.title=Orion
+            org.opencontainers.image.description=Orion Discord bot
+            org.opencontainers.image.version=${{ steps.release.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+
+      - name: Build and push production image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: false
+          sbom: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Confirm published tags
+        shell: bash
+        env:
+          OWNER: ${{ steps.release.outputs.owner }}
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          echo "Published:"
+          echo "  ghcr.io/$OWNER/orion:$VERSION"
+          echo "  ghcr.io/$OWNER/orion:v$VERSION"
+          echo "  ghcr.io/$OWNER/orion:latest"

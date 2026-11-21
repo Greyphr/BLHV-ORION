@@ -1,0 +1,181 @@
+name: orion
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+services:
+  # PostgreSQL is deliberately never watched or updated by WUD.
+  db:
+    image: postgres:16-alpine
+    container_name: orion-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-orion}
+      POSTGRES_USER: ${POSTGRES_USER:-orion}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in the deployment .env file}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks:
+      - orion_internal
+    labels:
+      - wud.watch=false
+    logging: *default-logging
+
+  # Daily logical backups. This container is only a backup worker, not an update target.
+  backup:
+    image: postgres:16-alpine
+    container_name: orion-db-backup
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-orion}
+      POSTGRES_USER: ${POSTGRES_USER:-orion}
+      PGPASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in the deployment .env file}
+      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-14}
+    volumes:
+      - pgbackups:/backups
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - orion_internal
+    labels:
+      - wud.watch=false
+    logging: *default-logging
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        while true; do
+          f=/backups/orion-$$(date +%Y-%m-%d_%H%M).sql.gz
+          if pg_dump -h db -U "$$POSTGRES_USER" -d "$$POSTGRES_DB" -f /tmp/orion-dump.sql \
+             && gzip -c /tmp/orion-dump.sql > "$$f.tmp" \
+             && mv "$$f.tmp" "$$f"; then
+            echo "backup ok: $$f"
+          else
+            rm -f "$$f.tmp"
+            echo "BACKUP FAILED"
+          fi
+          rm -f /tmp/orion-dump.sql
+          find /backups -name 'orion-*.sql.gz' -mtime +"$$BACKUP_RETENTION_DAYS" -delete
+          sleep 86400
+        done
+
+  bot:
+    # Start with a numeric release tag (for example 1.0.0). WUD only considers
+    # numeric semver tags because of the wud.tag.include label below, so it will
+    # never deploy development builds or the floating :latest tag.
+    image: ghcr.io/${GHCR_OWNER:?Set GHCR_OWNER in the deployment .env file}/orion:${ORION_IMAGE_TAG:?Set ORION_IMAGE_TAG to the first release version}
+    container_name: orion-bot
+    restart: unless-stopped
+    stop_grace_period: 60s
+    env_file:
+      - orion.env
+    environment:
+      DB_HOST: db
+      DB_PORT: "5432"
+      DB_USER: ${POSTGRES_USER:-orion}
+      DB_NAME: ${POSTGRES_DB:-orion}
+      DB_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in the deployment .env file}
+      DATA_DIR: /app/data
+      HEALTH_HOST: 127.0.0.1
+      HEALTH_PORT: "8080"
+    volumes:
+      - orion_data:/app/data
+      - orion_assets:/app/assets
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "/usr/local/bin/docker-healthcheck.py"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 180s
+    networks:
+      - orion_internal
+    labels:
+      # WUD watches this container and no other container in the project.
+      - wud.watch=true
+      - wud.watch.digest=false
+      - 'wud.tag.include=^\d+\.\d+\.\d+$$'
+      - wud.link.changelog=https://github.com/${GITHUB_REPOSITORY:-Greyphr/BLHV-ORION}/releases/tag/v$${version}
+      - wud.trigger.dockercompose.local.enabled=true
+      - wud.trigger.discord.local.enabled=true
+      - wud.rollback.enable=${WUD_ROLLBACK_ENABLED:-false}
+      - wud.rollback.window=${WUD_ROLLBACK_WINDOW_MS:-180000}
+      - wud.rollback.interval=${WUD_ROLLBACK_INTERVAL_MS:-10000}
+      - wud.rollback.grace=${WUD_ROLLBACK_GRACE_MS:-15000}
+    logging: *default-logging
+
+  updater:
+    image: getwud/wud:latest
+    container_name: orion-updater
+    restart: unless-stopped
+    environment:
+      TZ: ${TZ:-UTC}
+
+      # No public/private dashboard or API is needed on the hosting machine.
+      WUD_SERVER_ENABLED: "false"
+
+      # Strict opt-in: only containers labelled wud.watch=true are discovered.
+      WUD_WATCHER_LOCAL_SOCKET: /var/run/docker.sock
+      WUD_WATCHER_LOCAL_WATCHBYDEFAULT: "false"
+      WUD_WATCHER_LOCAL_WATCHALL: "false"
+      WUD_WATCHER_LOCAL_WATCHATSTART: "true"
+      WUD_WATCHER_LOCAL_CRON: ${WUD_CHECK_CRON:-0 */6 * * *}
+
+      # WUD needs its own read-only GHCR credential to inspect private tags.
+      # These values are never passed to the Orion application container.
+      WUD_REGISTRY_GHCR_LOCAL_USERNAME: ${GHCR_USERNAME:?Set GHCR_USERNAME in the deployment .env file}
+      WUD_REGISTRY_GHCR_LOCAL_TOKEN: ${GHCR_TOKEN:?Set GHCR_TOKEN in the deployment .env file}
+
+      # WUD may rewrite only the mounted Compose file. It never receives orion.env.
+      WUD_TRIGGER_DOCKERCOMPOSE_LOCAL_FILE: /production/compose.yaml
+      WUD_TRIGGER_DOCKERCOMPOSE_LOCAL_AUTO: ${WUD_AUTO_UPDATE:-false}
+      WUD_TRIGGER_DOCKERCOMPOSE_LOCAL_INCLUDEBYDEFAULT: "false"
+      WUD_TRIGGER_DOCKERCOMPOSE_LOCAL_ONDIGEST: "false"
+      WUD_TRIGGER_DOCKERCOMPOSE_LOCAL_BACKUP: "true"
+      WUD_TRIGGER_DOCKERCOMPOSE_LOCAL_PRUNE: "false"
+      WUD_TRIGGER_DOCKERCOMPOSE_LOCAL_SELFUPDATE: "false"
+      WUD_TRIGGER_DOCKERCOMPOSE_LOCAL_ROLLBACK: ${WUD_ROLLBACK_ENABLED:-false}
+      WUD_TRIGGER_DOCKERCOMPOSE_LOCAL_ROLLBACKWINDOW: ${WUD_ROLLBACK_WINDOW_MS:-180000}
+      WUD_TRIGGER_DOCKERCOMPOSE_LOCAL_ROLLBACKINTERVAL: ${WUD_ROLLBACK_INTERVAL_MS:-10000}
+      WUD_TRIGGER_DOCKERCOMPOSE_LOCAL_ROLLBACKGRACE: ${WUD_ROLLBACK_GRACE_MS:-15000}
+
+      # Notifications: detected / started / success / failure / rollback.
+      WUD_TRIGGER_DISCORD_LOCAL_URL: ${DEPLOY_WEBHOOK_URL:?Set DEPLOY_WEBHOOK_URL in the deployment .env file}
+      WUD_TRIGGER_DISCORD_LOCAL_AUTO: "true"
+      WUD_TRIGGER_DISCORD_LOCAL_INCLUDEBYDEFAULT: "false"
+      WUD_TRIGGER_DISCORD_LOCAL_EVENTS: available,pre,success,failure,rollback
+      WUD_TRIGGER_DISCORD_LOCAL_BOTUSERNAME: Orion Deploy
+      WUD_TRIGGER_DISCORD_LOCAL_SIMPLETITLE: 'Orion update available: $${container.updateKind.remoteValue}'
+      WUD_TRIGGER_DISCORD_LOCAL_SUCCESSTITLE: 'Orion update SUCCESS: $${container.updateKind.remoteValue}'
+      WUD_TRIGGER_DISCORD_LOCAL_FAILURETITLE: 'Orion update FAILED'
+      WUD_TRIGGER_DISCORD_LOCAL_ROLLBACKTITLE: 'Orion ROLLBACK'
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./compose.yaml:/production/compose.yaml
+    networks:
+      - orion_internal
+    labels:
+      - wud.watch=false
+    logging: *default-logging
+
+networks:
+  orion_internal:
+    driver: bridge
+
+volumes:
+  pgdata:
+  pgbackups:
+  orion_data:
+  orion_assets:

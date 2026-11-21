@@ -38,7 +38,7 @@ including `/xp`. The **Staff** role (`STAFF_ROLE_IDS`) gets the staff commands a
 3. Invite the bot with this link (swap in your client ID). It includes Connect and Speak, which the music player needs:
 
    ```
-   https://discord.com/oauth2/authorize?client_id=YOUR_CLIENT_ID&permissions=271830032&scope=bot%20applications.commands
+   https://discord.com/oauth2/authorize?client_id=YOUR_CLIENT_ID&permissions=1099783466006&scope=bot%20applications.commands
    ```
 
 4. In the server, drag the bot's role above the level roles (Earth King up to Orion). If it sits below them it can't hand them out.
@@ -215,26 +215,69 @@ per-realm banners can be dropped into `assets/milestones/<realm name in lower ca
 each member's event history shows on `/profile`. Attendance can be recorded in the database (`event_signups.attended`); commands to
 mark attendance, cancel events and send reminders are planned (Phase 7).
 
+## Moderation
+
+Everything is recorded as a numbered **case** (warn, note, timeout, untimeout, kick, ban, unban), posted to a staff-only **mod-log** channel
+and written to the audit log. Run **`/mod setup`** once to create the channel. The bot needs Kick Members, Ban Members, Moderate Members and
+Manage Messages (all in the invite link in this README).
+
+**Commands (staff):** `/warn`, `/note` (private, the member isn't told), `/timeout` (30m, 2h, 7d ... max 28d), `/untimeout`, `/case <number>`,
+`/case-reason`, `/cases <user>`, `/reports`. **Sect Admin only by default:** `/kick`, `/ban` (permanent, or temporary with a duration, optional
+message deletion for 0 to 7 days), `/unban <user ID>`, `/pardon <case>` (a pardoned warning stops counting). Temporary bans lift themselves, even
+after a restart. **Members:** `/warnings` shows their own active warnings (without the moderator's name) and `/report` sends a private report
+to the staff (rate-limited, no self-reports, no duplicates within 24 hours). Staff handle a report with the buttons under it in the mod log.
+Members are DMed the reason and case number (`/mod set dm-members off` to stop that). Staff looking at a member with `/profile` also see
+that member's moderation record.
+
+**Safety rules for every action:** you can't act on yourself, the server owner / Sect Patriarch, other bots, or someone whose top role is equal to
+or above yours. Staff can't act on staff or Sect Admins (only a Sect Admin can act on staff). The bot's own role must be above the target. If
+Discord refuses (missing permission, role order), nothing is recorded and you are told why. A kick or ban DMs the member *before* acting,
+because afterwards there is no shared server; if the action then fails, you are told they were already notified.
+
+**Who may do what** is configurable: `/mod set admin-only ban,kick,unban,pardon` (list any of warn, note, timeout, untimeout, kick, ban, unban, pardon).
+
+**Auto-moderation** (defaults are deliberately gentle: **alert only**, nothing is deleted or punished automatically):
+* **Spam:** flags a message flood (default 6 messages in 5s), the same message repeated (4 copies in 30s) and mass mentions (6 or more in one
+  message). Staff, bots, exempt roles and exempt channels are never checked (`/mod exempt`). `/mod set spam alert|act|off`. In `act` mode it
+  deletes the flagged messages, times the member out (default 10 minutes), records a case and DMs them.
+* **Raids:** alerts (pinging staff) when 8 members join within 30 seconds. `/mod set raid act` also times out the accounts in that burst that are
+  younger than 7 days (default 60 minutes). Nobody is banned or kicked automatically.
+* **Warning escalation:** off by default. `/mod set escalate-every 3` times a member out whenever they reach another 3 active warnings within
+  30 days (`escalate-minutes`, `warn-window-days`).
+* Tune with `/mod set` (`spam-rate 6/5`, `spam-duplicates 4/30`, `spam-mentions 6`, `raid-joins 8/30`, ...) and look at everything with `/mod status`.
+
 ## Announcements
 
 `/announce new` opens a private builder with a live preview. From it you can:
 
-* edit the title, description, footer and colour (hex or the dropdown)
+* edit the title, description, footer, **author line** and colour (hex or the dropdown)
 * add a thumbnail, a top banner and a bottom banner
+* add up to five **link buttons** (under *Images & links*, one per line as `Label | https://link`)
 * add or remove fields
 * pick the channel and which roles or members to mention
 * toggle the timestamp
 * set a mass ping (off, @here or @everyone), which asks for a confirmation first
-* save the draft as a template, or load one
-* publish
+* save the draft as a template, or load one (see below)
+* publish, or **schedule** it for later
+
+**Templates:** eight come built in: `general-sect`, `community-update`, `esports`, `tournament-results`, `recruitment`, `community-event`,
+`realm-milestone` and `maintenance`. Load one in the builder (or `/announce new template:...`) and change the text. Saving a template with
+the same name overrides the built-in one; deleting your version brings the built-in back.
+
+**Scheduling:** `/announce new when:"25/12 18:30"` (server time, Africa/Lagos by default) turns the Publish button into **Schedule**.
+`/announce scheduled` lists what is waiting and `/announce unschedule <number>` cancels one. A background check runs every 30 seconds; it
+retries on Discord outages, survives restarts, and tells the staff alerts channel if a scheduled post can't be sent (for example missing
+permissions). The mass-ping permission is checked when you schedule, and the channel permissions again when it is sent.
+
+**Edit and delete:** `/announce edit <message link>` reopens anything published through the bot and updates it in place;
+`/announce delete <message link>` removes it. `/announce history` lists recent ones. Publishing, editing, scheduling and deleting are all
+written to the audit log.
 
 To attach images straight away: `/announce new top_banner:<image> banner:<image>`. Images are stored in the database when you add them,
 so they keep working after Discord's temporary links expire.
 
-`/announce edit <message link>` reopens anything published through the bot and updates it in place. `/announce history` lists recent ones.
-
 The bot needs Mention Everyone (already in the invite link) to ping @here, @everyone and roles that aren't mentionable. The builder panel
-stays open for 14 minutes. Unfinished drafts aren't kept, templates are.
+stays open for 14 minutes. Unfinished drafts aren't kept, templates and scheduled announcements are.
 
 ## Twitch live alerts
 

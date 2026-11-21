@@ -3,34 +3,41 @@
 /announce new      -> opens a private builder panel (live preview, buttons, dropdowns, modals)
 /announce edit     -> reopen a previously published announcement and update it in place
 /announce history  -> last published announcements
-/announce templates / template-delete
+/announce delete   -> delete a published announcement
+/announce scheduled / unschedule -> announcements waiting to be published at a set time
+/announce templates / template-delete   (8 built-in templates + your own)
 
 Images are downloaded ONCE when staff add them and stored in the database. Discord CDN links expire
 after ~24h, so re-uploading them with every publish/edit keeps banners from breaking later.
 """
 import asyncio
+import copy
 import io
 import ipaddress
 import logging
 import re
 import socket
 from dataclasses import asdict, dataclass, field, fields
+from datetime import timedelta
 from urllib.parse import urlparse
 
 import aiohttp
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 from PIL import Image
 
-from .. import config
+from .. import alerts, config
 from ..checks import require_staff
+from ..events import TimeParseError, parse_when
 
+utcnow = discord.utils.utcnow
 log = logging.getLogger("orion.announce")
 
 MAX_IMG = 6 * 1024 * 1024
-PALETTE = {"Violet": 0x7C3AED, "Dark purple": 0x4C1D95, "Midnight": 0x0B0614, "Silver": 0xCBCBDC,
-           "White": 0xFFFFFF, "Crimson": 0xDC2626, "Emerald": 0x10B981, "Gold": 0xF59E0B}
+PALETTE = {"Sky blue": 0x38BDF8, "Deep blue": 0x1E3A8A, "Midnight": 0x060A1F, "Silver": 0xCBD5E1,
+           "White": 0xFFFFFF, "Crimson": 0xDC2626, "Emerald": 0x10B981, "Gold": 0xFACC15}
+MAX_BUTTONS = 5
 PING_MODES = ["none", "here", "everyone"]
 
 
@@ -100,6 +107,8 @@ class Draft:
     thumb_id: int | None = None
     banner_id: int | None = None          # bottom banner
     top_banner_id: int | None = None      # top banner
+    author: str = ""                      # small line above the title
+    buttons: list = field(default_factory=list)   # link buttons: [{"label", "url"}], at most 5
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -107,11 +116,13 @@ class Draft:
     @classmethod
     def from_dict(cls, d: dict) -> "Draft":
         known = {f.name for f in fields(cls)}
-        return cls(**{k: v for k, v in d.items() if k in known})
+        return cls(**{k: copy.deepcopy(v) for k, v in d.items() if k in known})   # never share lists with a template
 
 
 def build_embed(d: Draft, thumb: str | None = None, banner: str | None = None, when=None) -> discord.Embed:
     e = discord.Embed(title=d.title or None, description=d.description or None, color=d.color)
+    if d.author:
+        e.set_author(name=d.author)
     for f in d.fields:
         e.add_field(name=f["name"], value=f["value"], inline=f.get("inline", False))
     if d.footer:
@@ -143,6 +154,57 @@ def build_embeds(d: Draft, thumb: str | None = None, banner: str | None = None, 
     return [head, main]
 
 
+def parse_links(text: str) -> list[dict]:
+    """'Label | https://link' per line, at most 5. Raises ValueError with a plain message."""
+    out = []
+    for n, line in enumerate((l.strip() for l in text.splitlines()), 1):
+        if not line:
+            continue
+        label, sep, url = (x.strip() for x in line.partition("|"))
+        if not sep or not label or not url:
+            raise ValueError(f"line {n}: write it as  Label | https://link")
+        u = urlparse(url)
+        if u.scheme not in ("http", "https") or not u.netloc or len(url) > 512:
+            raise ValueError(f"line {n}: the link must start with http:// or https://")
+        if len(label) > 80:
+            raise ValueError(f"line {n}: the button label is too long (max 80)")
+        out.append({"label": label, "url": url})
+    if len(out) > MAX_BUTTONS:
+        raise ValueError(f"at most {MAX_BUTTONS} link buttons")
+    return out
+
+
+def link_view(d: Draft) -> discord.ui.View | None:
+    """Link buttons shown under the announcement (they need no listener, so they keep working forever)."""
+    if not d.buttons:
+        return None
+    v = discord.ui.View(timeout=None)
+    for b in d.buttons[:MAX_BUTTONS]:
+        v.add_item(discord.ui.Button(style=discord.ButtonStyle.link, label=b["label"], url=b["url"]))
+    return v
+
+
+async def load_assets(db, draft: Draft):
+    """(files, thumbnail url, bottom banner url, top banner url) for a draft, without a Builder."""
+    files, urls = [], {}
+    for key, iid in (("thumbnail", draft.thumb_id), ("top_banner", draft.top_banner_id), ("banner", draft.banner_id)):
+        row = await db.get_image(iid) if iid is not None else None
+        if row:
+            name = f"{key}.{row['ext']}"
+            files.append(discord.File(io.BytesIO(row["data"]), filename=name))
+            urls[key] = f"attachment://{name}"
+    return files, urls.get("thumbnail"), urls.get("banner"), urls.get("top_banner")
+
+
+def mention_parts(mentions: list, ping: str) -> tuple[str | None, discord.AllowedMentions]:
+    parts = {"everyone": ["@everyone"], "here": ["@here"]}.get(ping, [])
+    parts += [f"<@&{m['id']}>" if m["t"] == "role" else f"<@{m['id']}>" for m in mentions]
+    allowed = discord.AllowedMentions(
+        everyone=ping != "none", roles=[discord.Object(m["id"]) for m in mentions if m["t"] == "role"],
+        users=[discord.Object(m["id"]) for m in mentions if m["t"] == "user"])
+    return (" ".join(parts) or None), allowed
+
+
 # ------------------------------------------------------------------ modals
 class ContentModal(discord.ui.Modal, title="Announcement content"):
     def __init__(self, b: "Builder"):
@@ -153,25 +215,28 @@ class ContentModal(discord.ui.Modal, title="Announcement content"):
                                          default=d.description, required=False, max_length=4000)
         self.foot = discord.ui.TextInput(label="Footer", default=d.footer, required=False, max_length=200)
         self.col = discord.ui.TextInput(label="Custom colour (hex, optional)", required=False, max_length=7,
-                                        placeholder="#7C3AED")
-        for i in (self.t, self.desc, self.foot, self.col):
+                                        placeholder="#38BDF8")
+        self.auth = discord.ui.TextInput(label="Author line (small text above the title)", default=d.author,
+                                         required=False, max_length=100)
+        for i in (self.t, self.desc, self.foot, self.col, self.auth):
             self.add_item(i)
 
     async def on_submit(self, i: discord.Interaction):
         await i.response.defer()
         d, notice = self.b.draft, None
         d.title, d.description, d.footer = self.t.value.strip(), self.desc.value.strip(), self.foot.value.strip()
+        d.author = self.auth.value.strip()
         if self.col.value.strip():
             try:
                 d.color = int(self.col.value.strip().lstrip("#"), 16)
                 if not 0 <= d.color <= 0xFFFFFF:
                     raise ValueError
             except ValueError:
-                notice = "⚠️ That colour isn't valid hex (example: #7C3AED)."
+                notice = "⚠️ That colour isn't valid hex (example: #38BDF8)."
         await self.b.render(notice)
 
 
-class ImagesModal(discord.ui.Modal, title="Thumbnail & banners"):
+class ImagesModal(discord.ui.Modal, title="Images & link buttons"):
     def __init__(self, b: "Builder"):
         super().__init__()
         self.b = b
@@ -181,13 +246,22 @@ class ImagesModal(discord.ui.Modal, title="Thumbnail & banners"):
                                         placeholder="https://… or 'clear'")
         self.banner = discord.ui.TextInput(label="Bottom banner link (large, below the text)", required=False,
                                            placeholder="https://… or 'clear'")
+        self.links = discord.ui.TextInput(
+            label="Link buttons: one per line, Label | https://link", style=discord.TextStyle.paragraph, required=False,
+            max_length=1000, placeholder="Join the event | https://discord.gg/…",
+            default="\n".join(f"{b['label']} | {b['url']}" for b in b.draft.buttons)[:1000] or None)
         self.add_item(self.thumb)
         self.add_item(self.top)
         self.add_item(self.banner)
+        self.add_item(self.links)
 
     async def on_submit(self, i: discord.Interaction):
         await i.response.defer()
         errors = []
+        try:
+            self.b.draft.buttons = parse_links(self.links.value)      # blank clears them
+        except ValueError as e:
+            errors.append(f"Link buttons: {e}")
         for inp, attr in ((self.thumb, "thumb_id"), (self.top, "top_banner_id"), (self.banner, "banner_id")):
             v = inp.value.strip()
             if not v:
@@ -254,11 +328,12 @@ class TemplatePicker(discord.ui.View):
 # ----------------------------------------------------------------- builder
 class Builder(discord.ui.View):
     def __init__(self, bot, origin: discord.Interaction, draft: Draft, channel_id=None,
-                 mentions=None, ping="none", edit=None):
+                 mentions=None, ping="none", edit=None, when=None):
         super().__init__(timeout=840)  # stays inside the 15-minute interaction token life
         self.bot, self.origin, self.draft = bot, origin, draft
         self.author_id = origin.user.id
         self.channel_id, self.mentions, self.ping, self.edit = channel_id, mentions or [], ping, edit
+        self.when = when                         # aware datetime: publish later instead of now
         self.notice = None
         self._armed = False
         self._imgs: dict[int, tuple[bytes, str] | None] = {}
@@ -314,6 +389,8 @@ class Builder(discord.ui.View):
         size = len(build_embed(d))
         if size > 6000:
             p.append(f"the embed is too long ({size}/6000 characters)")
+        if self.when and self.when <= utcnow():
+            p.append("the scheduled time has already passed (start again with a later time)")
         if ch:
             you, me = ch.permissions_for(self.origin.user), ch.permissions_for(g.me)
             if not (you.send_messages and you.embed_links):
@@ -346,8 +423,8 @@ class Builder(discord.ui.View):
         self.b_ping.disabled = bool(self.edit)
         self.b_remove.disabled = not self.draft.fields
         self.b_field.disabled = len(self.draft.fields) >= 25
-        self.b_publish.label = ("Confirm & publish" if self._armed else
-                                "Save changes" if self.edit else "Publish")
+        self.b_publish.label = ("Confirm & publish" if self._armed else "Save changes" if self.edit else
+                                "Schedule" if self.when else "Publish")
         self.b_publish.style = discord.ButtonStyle.danger if self._armed else discord.ButtonStyle.success
 
     def _status(self) -> str:
@@ -355,6 +432,8 @@ class Builder(discord.ui.View):
         men = " ".join(f"<@&{m['id']}>" if m["t"] == "role" else f"<@{m['id']}>" for m in self.mentions) or "none"
         lines = [f"**{'✏️ Editing announcement' if self.edit else '📣 Announcement builder'}**",
                  f"Channel: {ch}  ·  Mentions: {men}  ·  Mass ping: **{self.ping}**"]
+        if self.when:
+            lines.append(f"🗓️ Will be published <t:{int(self.when.timestamp())}:F> (<t:{int(self.when.timestamp())}:R>)")
         if self.notice:
             lines.append(self.notice)
         return "\n".join(lines)
@@ -401,7 +480,7 @@ class Builder(discord.ui.View):
     async def b_content(self, i: discord.Interaction, _):
         await i.response.send_modal(ContentModal(self))
 
-    @discord.ui.button(label="Images", emoji="🖼️", style=discord.ButtonStyle.secondary, row=2)
+    @discord.ui.button(label="Images & links", emoji="🖼️", style=discord.ButtonStyle.secondary, row=2)
     async def b_images(self, i: discord.Interaction, _):
         await i.response.send_modal(ImagesModal(self))
 
@@ -469,6 +548,15 @@ class Builder(discord.ui.View):
     # ------------------------------------------------------------- publish
     async def _publish(self, i: discord.Interaction):
         db, ch = self.bot.db, self.origin.guild.get_channel(self.channel_id)
+        if self.when and not self.edit:
+            sid = await db.announce_schedule_add(ch.id, i.user.id, self.draft.to_dict(), self.mentions, self.ping,
+                                                 self.when)
+            await db.record_audit(i.user.id, "announce.schedule", "announcement", sid, channel=ch.id,
+                                  at=self.when.isoformat())
+            self.stop()
+            return await self.origin.edit_original_response(
+                content=f"🗓️ Scheduled **#{sid}** for <t:{int(self.when.timestamp())}:F> in {ch.mention}. "
+                        f"See or cancel it with `/announce scheduled`.", embed=None, attachments=[], view=None)
         files, thumb, banner, top = await self.assets()
         when = self.edit["published_at"] if self.edit else None
         embeds = build_embeds(self.draft, thumb, banner, top, when)
@@ -480,15 +568,19 @@ class Builder(discord.ui.View):
                 except discord.NotFound:
                     return await self.render("⚠️ The original message was deleted, so it can't be edited. "
                                              "Start a new announcement instead.")
-                await msg.edit(content=content, embeds=embeds, attachments=files, allowed_mentions=self.allowed())
+                await msg.edit(content=content, embeds=embeds, attachments=files, allowed_mentions=self.allowed(),
+                               view=link_view(self.draft))
                 await db.update_announcement(msg.id, self.draft.title, self.draft.to_dict(), self.mentions, self.ping)
             else:
-                msg = await ch.send(content=content, embeds=embeds, files=files, allowed_mentions=self.allowed())
+                msg = await ch.send(content=content, embeds=embeds, files=files, allowed_mentions=self.allowed(),
+                                    view=link_view(self.draft))
                 await db.save_announcement(ch.id, msg.id, i.user.id, self.draft.title,
                                            self.draft.to_dict(), self.mentions, self.ping)
         except discord.HTTPException as e:
             log.exception("Publish failed")
             return await self.render(f"⚠️ Discord refused the message: {e.text}")
+        await db.record_audit(i.user.id, "announce.edit" if self.edit else "announce.publish", "announcement", msg.id,
+                              channel=ch.id, title=self.draft.title)
         self.stop()
         await self.origin.edit_original_response(
             content=f"✅ {'Updated' if self.edit else 'Published'}: {msg.jump_url}",
@@ -500,8 +592,58 @@ class Announce(commands.GroupCog, name="announce", description="Announcement bui
     def __init__(self, bot):
         self.bot = bot
 
+    async def cog_load(self):
+        await self.bot.db.announce_release_stuck()
+        self.scheduler.start()
+
+    async def cog_unload(self):
+        self.scheduler.cancel()
+
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         return await require_staff(interaction)
+
+    # ------------------------------------------------------------ scheduler
+    @tasks.loop(seconds=30)
+    async def scheduler(self):
+        for row in await self.bot.db.announce_claim_due(5):
+            try:
+                await self._publish_scheduled(row)
+            except Exception:
+                log.exception("Scheduled announcement #%s crashed", row["id"])
+                await self.bot.db.announce_finish(row["id"], "failed", error="internal error")
+
+    @scheduler.before_loop
+    async def _wait(self):
+        await self.bot.wait_until_ready()
+
+    @scheduler.error
+    async def _scheduler_error(self, exc):
+        log.exception("Announcement scheduler stopped", exc_info=exc)
+
+    async def _publish_scheduled(self, r):
+        db, guild = self.bot.db, self.bot.get_guild(config.GUILD_ID)
+        ch = guild.get_channel(r["channel_id"]) if guild else None
+        if ch is None:
+            return await db.announce_finish(r["id"], "failed", error="the channel no longer exists")
+        draft = Draft.from_dict(r["data"])
+        files, thumb, banner, top = await load_assets(db, draft)
+        content, allowed = mention_parts(r["mentions"], r["ping_mode"])
+        try:
+            msg = await ch.send(content=content, embeds=build_embeds(draft, thumb, banner, top), files=files,
+                                allowed_mentions=allowed, view=link_view(draft))
+        except discord.HTTPException as e:
+            retry = r["attempts"] < 3 and (e.status >= 500 or e.status == 429)
+            if retry:
+                return await db.announce_finish(r["id"], "pending", error=f"Discord error {e.status}",
+                                                retry_at=utcnow() + timedelta(minutes=2))
+            await db.announce_finish(r["id"], "failed", error=f"Discord refused it: {e.text}"[:300])
+            return await alerts.alert_staff(
+                self.bot, guild, f"Scheduled announcement #{r['id']} could not be published in {ch.mention}: {e.text} "
+                f"(missing permissions?). Fix it and schedule it again.", key=f"announce-sched-{r['id']}")
+        await db.save_announcement(ch.id, msg.id, r["author_id"], draft.title, draft.to_dict(), r["mentions"],
+                                   r["ping_mode"])
+        await db.announce_finish(r["id"], "published", message_id=msg.id)
+        await db.record_audit(None, "announce.publish_scheduled", "announcement", msg.id, schedule_id=r["id"])
 
     async def _template_ac(self, i: discord.Interaction, current: str):
         names = await self.bot.db.list_templates()
@@ -511,11 +653,19 @@ class Announce(commands.GroupCog, name="announce", description="Announcement bui
     @app_commands.describe(channel="Where to publish (you can change it in the builder)",
                            template="Start from a saved template",
                            thumbnail="Small image shown top-right", banner="Large image shown at the bottom",
-                           top_banner="Large image shown at the top")
+                           top_banner="Large image shown at the top",
+                           when="Publish later: date and time in server time, e.g. 25/12 18:30 or 2026-12-25 18:30")
     @app_commands.autocomplete(template=_template_ac)
     async def new(self, i: discord.Interaction, channel: discord.TextChannel | None = None,
                   template: str | None = None, thumbnail: discord.Attachment | None = None,
-                  banner: discord.Attachment | None = None, top_banner: discord.Attachment | None = None):
+                  banner: discord.Attachment | None = None, top_banner: discord.Attachment | None = None,
+                  when: str | None = None):
+        publish_at = None
+        if when:
+            try:
+                publish_at = parse_when(when)
+            except TimeParseError as e:
+                return await i.response.send_message(f"⚠️ {e}", ephemeral=True)
         await i.response.defer(ephemeral=True)
         db, draft, notes = self.bot.db, Draft(), []
         if template:
@@ -530,7 +680,7 @@ class Announce(commands.GroupCog, name="announce", description="Announcement bui
                     setattr(draft, attr, await store_attachment(db, att))
                 except ValueError as e:
                     notes.append(f"{attr.removesuffix('_id').replace('_', ' ')}: {e}")
-        b = Builder(self.bot, i, draft, channel_id=channel.id if channel else None)
+        b = Builder(self.bot, i, draft, channel_id=channel.id if channel else None, when=publish_at)
         await b.render("⚠️ " + " ".join(notes) if notes else None)
 
     @app_commands.command(name="edit", description="Edit an announcement you published with Orion")
@@ -559,17 +709,63 @@ class Announce(commands.GroupCog, name="announce", description="Announcement bui
             embed=discord.Embed(title="Recent announcements", description="\n".join(lines), color=config.COLOR_MAIN),
             ephemeral=True)
 
+    @app_commands.command(name="delete", description="Delete an announcement published with Orion")
+    @app_commands.describe(message="Message link or ID")
+    async def delete(self, i: discord.Interaction, message: str):
+        m = re.search(r"(\d{17,20})\s*$", message)
+        rec = await self.bot.db.get_announcement(int(m.group(1))) if m else None
+        if not rec:
+            return await i.response.send_message("I can only delete announcements published through `/announce new`.",
+                                                 ephemeral=True)
+        await i.response.defer(ephemeral=True)
+        ch = i.guild.get_channel(rec["channel_id"])
+        gone = ch is None
+        if ch:
+            try:
+                await (await ch.fetch_message(rec["message_id"])).delete()
+            except discord.NotFound:
+                gone = True
+            except discord.HTTPException as e:
+                return await i.followup.send(f"⚠️ Discord refused to delete it: {e.text}", ephemeral=True)
+        await self.bot.db.delete_announcement_record(rec["message_id"])
+        await self.bot.db.record_audit(i.user.id, "announce.delete", "announcement", rec["message_id"],
+                                       title=rec["title"])
+        await i.followup.send("🗑️ Deleted." + (" (It was already gone from Discord.)" if gone else ""), ephemeral=True)
+
+    @app_commands.command(name="scheduled", description="Announcements waiting to be published")
+    async def scheduled(self, i: discord.Interaction):
+        rows = await self.bot.db.announce_scheduled_list(15)
+        if not rows:
+            return await i.response.send_message("Nothing is scheduled. Use `/announce new when:...`.", ephemeral=True)
+        lines = []
+        for r in rows:
+            title = (r["data"].get("title") or "Untitled")[:60]
+            state = "🗓️" if r["status"] == "pending" else f"⚠️ failed ({r['error'] or '?'})"
+            lines.append(f"`#{r['id']}` {state} **{title}** · <#{r['channel_id']}> · "
+                         f"<t:{int(r['publish_at'].timestamp())}:F> (<t:{int(r['publish_at'].timestamp())}:R>)")
+        await i.response.send_message(embed=discord.Embed(title="Scheduled announcements", color=config.COLOR_MAIN,
+                                                          description="\n".join(lines)[:3900]), ephemeral=True)
+
+    @app_commands.command(name="unschedule", description="Cancel a scheduled announcement")
+    async def unschedule(self, i: discord.Interaction, id: int):
+        ok = await self.bot.db.announce_cancel_scheduled(id)
+        if ok:
+            await self.bot.db.record_audit(i.user.id, "announce.unschedule", "announcement", id)
+        await i.response.send_message("✅ Cancelled." if ok else "No pending scheduled announcement with that number.",
+                                      ephemeral=True)
+
     @app_commands.command(name="templates", description="List saved templates")
     async def templates(self, i: discord.Interaction):
         names = await self.bot.db.list_templates()
-        await i.response.send_message("Templates: " + (", ".join(f"`{n}`" for n in names) or "none yet"),
-                                      ephemeral=True)
+        await i.response.send_message("Templates (the first eight are built in; save your own from the builder): "
+                                      + (", ".join(f"`{n}`" for n in names) or "none"), ephemeral=True)
 
     @app_commands.command(name="template-delete", description="Delete a saved template")
     @app_commands.autocomplete(name=_template_ac)
     async def template_delete(self, i: discord.Interaction, name: str):
         ok = await self.bot.db.delete_template(name)
-        await i.response.send_message("Deleted." if ok else "No template with that name.", ephemeral=True)
+        await i.response.send_message("Deleted." if ok else "No saved template with that name (built-in templates can't "
+                                      "be deleted).", ephemeral=True)
 
 
 async def setup(bot):

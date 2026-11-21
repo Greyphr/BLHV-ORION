@@ -1,0 +1,25 @@
+**
+!requirements.txt
+!orion/
+!orion/**
+!assets/
+!assets/**
+!scripts/
+!scripts/docker-healthcheck.py
+
+# Defence in depth: these are never copied even if the allowlist above is widened.
+**/.env
+**/.env.*
+**/orion.env
+**/orion.env.*
+**/*cookies*
+**/*.db
+**/*.sqlite
+**/*.sqlite3
+**/*.log
+**/.git
+**/.git/**
+**/backups/
+**/data/
+**/__pycache__/
+**/*.pyc

@@ -92,3 +92,14 @@ could never have run. Orion now has that store (`orion/event_db.py`, migration 0
 The Menace AI helper was a one-shot, single-ticket-type flow tied to its beta role. It was replaced by a general hybrid handler
 (`orion/ticket_ai.py` = decision rules, `orion/ticket_ai_runner.py` = Discord side, `orion/cogs/ai_admin.py` = `/ai` controls). Menace's
 Rivals Fantasy ticket type and its auto role-grant were removed from the ticket system; the beta-keys module remains but is dormant.
+
+## Addendum 3 (Phase 5)
+
+Menace's announcement builder already covered drafts, previews, images, fields, mentions, templates, edit and history. Added for Blue Heaven:
+author line, link buttons, scheduling with a retrying scheduler, delete, the eight starter templates, a blue palette and audit entries.
+A test found that a draft loaded from a built-in template shared lists with the template; drafts are now deep-copied.
+
+## Addendum 4 (Phase 6)
+
+Moderation was entirely new (Menace had none): `orion/mod_db.py`, `orion/services/moderation.py` (pure rules), `orion/mod_ui.py`,
+`orion/cogs/moderation.py`, migration 0006. Bot permissions added: Kick Members, Ban Members, Moderate Members, Manage Messages.

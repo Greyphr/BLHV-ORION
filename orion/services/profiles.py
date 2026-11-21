@@ -33,7 +33,7 @@ async def get_profile(db, member_id: int, *, joined_at: Optional[datetime] = Non
     }
     if include_staff:
         hist = await db.progression_history(member_id, 5)
-        data["staff"] = {"progression": [{"old_level": h["old_level"], "new_level": h["new_level"],
+        data["staff"] = {"moderation": await db.mod_summary(member_id), "progression": [{"old_level": h["old_level"], "new_level": h["new_level"],
                                           "source": h["source"], "actor_id": h["actor_id"],
                                           "at": h["created_at"], "new_xp": h["new_xp"]} for h in hist]}
     return data

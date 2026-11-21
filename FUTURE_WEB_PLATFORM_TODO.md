@@ -29,7 +29,8 @@ Status legend: **Implemented** = done in the bot today. **Prepared** = architect
 | AI ticket handler | hybrid handler: knowledge base, per-ticket and global switch, tone/length/confidence settings, escalation + summaries, auto-close of routine tickets, activity log (`/ai`) | decision rules in `ticket_ai.py` are pure and reusable by an API | dashboard screens for the same settings; embeddings-based knowledge search if keyword matching proves too weak |
 | Achievements | tables, `/achievement` commands, shown on profiles | | automatic unlock conditions, notifications, XP/role rewards, admin UI (Phase 7) |
 | Events | event + sign-up store, waitlist promotion, history on profiles (the Menace upload shipped the cog without this store) | | attendance commands, cancel, reminders, recurring events (Phase 7) |
-| Moderation | | | build (Phase 6) |
+| Announcements | builder, 8 built-in templates, author line, link buttons, scheduling (`scheduled_announcements`), edit, delete, audit entries | `announce` data (`Draft` JSON) is plain and API-ready | dashboard embed builder; destination-channel allow-list per role |
+| Moderation | cases, warn/note/timeout/kick/ban/unban/pardon, temp bans, reports, spam + raid detection, escalation, audit entries; rules in `services/moderation.py` | `ModStore` + the pure rules are API-ready | dashboard case browser; appeals workflow; an `on_member_ban` listener to record bans made outside Orion; link reports to cases |
 | Dashboard / API / OAuth2 | | | everything below |
 
 ## A. Dashboard
@@ -48,9 +49,11 @@ Status legend: **Implemented** = done in the bot today. **Prepared** = architect
 
 ## C. Database
 - Reusable now: `users`, `xp_period`, `config`, `progression_history`, `audit_log`, tickets, announcements, polls, giveaways.
+- Added in migration 0006: `mod_cases` (id = case number), `mod_reports`.
+- Added in migration 0005: `scheduled_announcements`.
 - Added in migration 0004: `tickets.ai_state / ai_replies / ai_category / ai_summary`, `ai_knowledge`, `ai_logs`.
 - Added in migration 0003: `events`, `event_signups` (with `attended`), `achievements`, `member_achievements`, `users.joined_server_at`.
-- Still to add: `staff_permissions` (role_id, permission), `moderation_cases`, `ai_conversations`, `knowledge_base`,
+- Still to add: `staff_permissions` (role_id, permission), `ai_conversations`, `knowledge_base`,
   dashboard sessions (if not stateless).
 - `member_profiles` is not needed yet: `users` plus `progression_history` cover it; add columns when join date and activity stats are built.
 - Keep one writer per rule: XP changes go through `Database.adjust_xp` / services only.
@@ -85,3 +88,5 @@ Status legend: **Implemented** = done in the bot today. **Prepared** = architect
 - **Events and achievements do not grant XP.** XP comes only from messages and voice.
 - AI may auto-close routine tickets; members may reopen tickets; **no transcript retention period** (kept indefinitely).
 - Kept from Menace: Twitch live alerts, polls, welcome card, DM banner, music, giveaways, beta-keys (dormant until its role IDs are set).
+- Moderation defaults chosen by the developer (owner did not specify): staff can warn/timeout/note, kick/ban/unban/pardon need the Sect Admin
+  role, escalation off, spam and raid detection alert-only. All are changeable with `/mod set`.

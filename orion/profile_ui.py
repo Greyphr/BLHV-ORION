@@ -60,6 +60,12 @@ def profile_embed(data: dict, member: discord.abc.User, *, staff_view: bool = Fa
             f"{_ts(h['at'], 'd')} {rank_name(h['old_level'])} → **{rank_name(h['new_level'])}** "
             f"({h['source']}{' by <@%s>' % h['actor_id'] if h['actor_id'] else ''})" for h in hist) or "*No progression recorded.*"
         e.add_field(name="🛡️ Staff: recent progression", value=text[:1000], inline=False)
+        mod = data["staff"].get("moderation")
+        if mod is not None:
+            parts = [f"{v['total']} {k}" for k, v in sorted(mod["by_action"].items())]
+            e.add_field(name="🛡️ Staff: moderation record", inline=False,
+                        value=(f"**{mod['active_warns']}** active warning(s) · " + ", ".join(parts)
+                               + f"\nUse `/cases` for details.") if mod["total"] else "Clean record.")
         e.set_footer(text=f"User ID {data['member_id']}")
     else:
         e.set_footer(text=config.BRAND)

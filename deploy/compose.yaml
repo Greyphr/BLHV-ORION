@@ -88,6 +88,10 @@ services:
       DATA_DIR: /app/data
       HEALTH_HOST: 127.0.0.1
       HEALTH_PORT: "8080"
+      # Internal admin RPC: never published to the host.
+      BOT_RPC_HOST: 0.0.0.0
+      BOT_RPC_PORT: "8082"
+      BOT_RPC_TOKEN: ${BOT_RPC_TOKEN:?Set BOT_RPC_TOKEN in the deployment .env file}
     volumes:
       - orion_data:/app/data
       - orion_assets:/app/assets

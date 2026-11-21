@@ -216,6 +216,330 @@
       <pre>curl -H "Authorization: Bearer $ADMIN_API_TOKEN" http://127.0.0.1:8081/api/overview</pre></section>`;
   }
 
+  // ---------------- Discord /admin parity ----------------
+  let dash = null;
+  let dashTab = 'overview';
+  const DASH_TABS = ['overview', 'giveaways', 'polls', 'tickets', 'announcements', 'xp', 'features', 'welcome', 'dm', 'channels', 'staff', 'experimental'];
+  const FEATURE_KEYS = ['welcome_enabled', 'dm_enabled', 'leave_enabled', 'autorole_enabled',
+    'xp_messages_enabled', 'xp_voice_enabled', 'levelup_announce_enabled', 'music_enabled',
+    'tickets_enabled', 'ticket_dm_enabled'];
+  const RULE_KEYS = ['rule_msg_min', 'rule_msg_max', 'rule_cooldown', 'rule_daily_bonus',
+    'rule_min_chars', 'rule_voice_per_10min', 'rule_voice_cap'];
+
+  async function botAction(name, params, refresh = true) {
+    const data = await api('/api/bot/action', { method: 'POST', body: JSON.stringify({ action: name, params }) });
+    if (refresh) { dash = await api('/api/dashboard'); drawDashTab(); }
+    return data.result || {};
+  }
+  function jparse(value, fallback) { try { return JSON.parse(value); } catch (_) { return fallback; } }
+  function num(value) { const n = Number(value); return Number.isFinite(n) ? n : 0; }
+
+  function dashSection(title, body) { return `<section><h2>${esc(title)}</h2>${body}</section>`; }
+  function dashButtons(items) {
+    return `<div class="toolbar">${items.map(([label, action, params]) =>
+      `<button data-dash-action="${esc(action)}" data-dash-params="${esc(JSON.stringify(params || {}))}">${esc(label)}</button>`
+    ).join('')}</div>`;
+  }
+  function bindDashButtons() {
+    document.querySelectorAll('[data-dash-action]').forEach((btn) => {
+      btn.onclick = async () => {
+        if (!confirm(`Run ${btn.dataset.dashAction}?`)) return;
+        try {
+          const result = await botAction(btn.dataset.dashAction, jparse(btn.dataset.dashParams, {}));
+          if (result?.embed) {
+            const e = result.embed;
+            alert([e.title || 'Ticket stats', e.description || '',
+              ...(e.fields || []).map((f) => `${f.name}: ${f.value}`)].filter(Boolean).join('\n'));
+          }
+        }
+        catch (err) { alert(err.message || err); }
+      };
+    });
+  }
+  function modalForm(title, fields, action, mapper) {
+    openModal(title, fields, async (values) => {
+      await botAction(action, mapper(values));
+    });
+  }
+
+  function drawDashTab() {
+    const area = $('#dash-area');
+    if (!area || !dash) return;
+    const c = dash.config || {};
+    const out = [];
+
+    if (dashTab === 'overview') {
+      out.push(cards(Object.entries(dash.counts || {})));
+      out.push(dashSection('Bot', `<p>Guild: <strong>${esc(dash.guild?.name || 'unknown')}</strong>
+        <span class="muted">(${esc(dash.guild?.id || '')})</span></p>`));
+    }
+
+    if (dashTab === 'giveaways') {
+      out.push(dashButtons([['New giveaway', '__gw_new'], ['Reroll winner', '__gw_reroll']]));
+      out.push(dashSection('Giveaways', (dash.giveaways || []).length
+        ? tableHtml(['id', 'title', 'status', 'ends_at'], dash.giveaways.map((g) => ({
+            id: g.id, title: g.title, status: g.status, ends_at: g.ends_at
+          }))) : '<p class="muted">No giveaways yet.</p>'));
+      out.push(dashSection('Manage', (dash.giveaways || []).map((g) =>
+        `<div class="list-row"><span>#${g.id} ${esc(g.title)}</span><span>
+          <button data-dash-action="giveaway.end" data-dash-params='{"giveaway_id":${g.id}}'>End</button>
+          <button class="danger" data-dash-action="giveaway.cancel" data-dash-params='{"giveaway_id":${g.id}}'>Cancel</button>
+        </span></div>`).join('')));
+    }
+
+    if (dashTab === 'polls') {
+      out.push(dashButtons([['New poll', '__poll_new']]));
+      out.push(dashSection('Polls', (dash.polls || []).length
+        ? tableHtml(['id', 'question', 'status', 'ends_at'], dash.polls.map((p) => ({
+            id: p.id, question: p.question, status: p.status, ends_at: p.ends_at
+          }))) : '<p class="muted">No polls yet.</p>'));
+      out.push(dashSection('Manage', (dash.polls || []).map((p) =>
+        `<div class="list-row"><span>#${p.id} ${esc(p.question)}</span><span>
+          <button data-dash-action="poll.finish" data-dash-params='{"poll_id":${p.id}}'>Finish</button>
+          <button class="danger" data-dash-action="poll.delete" data-dash-params='{"poll_id":${p.id}}'>Delete</button>
+        </span></div>`).join('')));
+    }
+
+    if (dashTab === 'tickets') {
+      out.push(dashButtons([
+        ['Run setup', 'tickets.setup'], ['Refresh panel', 'tickets.panel_refresh'],
+        ['Reload types', 'tickets.types_reload'], ['New ticket type', '__tt_new'],
+        ['Set banner', '__banner_set'], ['Blacklist user', '__bl_add'], ['Show stats', 'tickets.stats']
+      ]));
+      out.push(dashSection('Ticket types', (dash.ticket_types || []).length
+        ? `<div class="list">${dash.ticket_types.map((t) =>
+          `<div class="list-row"><span>#${t.id} ${esc(t.emoji || '')} ${esc(t.name)} — ${esc(t.description || '')}</span><span>
+            <button data-dash-action="__tt_edit" data-dash-params='{"type_id":${t.id}}'>Edit</button>
+            <button class="danger" data-dash-action="tickets.type_delete" data-dash-params='{"type_id":${t.id}}'>Delete</button>
+          </span></div>`).join('')}</div>` : '<p class="muted">No ticket types.</p>'));
+      out.push(dashSection('Open tickets', tableHtml(['id', 'owner_id', 'type_name', 'created_at'],
+        (dash.tickets || []).map((t) => ({ id: t.id, owner_id: t.owner_id, type_name: t.type_name, created_at: t.created_at })))));
+      out.push(dashSection('Blacklist', tableHtml(['user_id', 'reason'], dash.blacklist || [])));
+      out.push(dashSection('Channels and ping roles', `<div class="field"><label>Log channel ID</label><input id="tk-log" value="${esc(c.ticket_log_channel_id || '')}"></div>
+        <div class="field"><label>Ping role IDs (comma-separated)</label><input id="tk-ping" value="${esc((c.ticket_ping_role_ids || []).join(','))}"></div>
+        <button id="tk-save">Save</button>`));
+    }
+
+    if (dashTab === 'announcements') {
+      out.push(dashButtons([['Publish announcement', '__ann_publish'], ['Schedule announcement', '__ann_schedule'], ['Save template', '__ann_template']]));
+      out.push(dashSection('Templates', `<div class="list">${(dash.templates || []).map((t) =>
+        `<div class="list-row"><span>${esc(t)}</span><button data-dash-action="announcement.template_delete" data-dash-params='{"name":${JSON.stringify(String(t))}}'>Delete</button></div>`).join('') || '<p class="muted">No templates.</p>'}</div>`));
+      out.push(dashSection('Scheduled', tableHtml(['id', 'channel_id', 'publish_at'], dash.scheduled || [])));
+      out.push(dashSection('Manage scheduled', (dash.scheduled || []).map((s) =>
+        `<button data-dash-action="announcement.cancel_scheduled" data-dash-params='{"schedule_id":${s.id}}'>Cancel #${s.id}</button>`).join(' ')));
+    }
+
+    if (dashTab === 'xp') {
+      out.push(dashButtons([['Reset XP rules', 'xp.rules.reset'], ['Resync all roles', 'xp.resync_roles'],
+        ['Adjust member XP', '__xp_adjust'], ['Set exclusion', '__xp_exclude']]));
+      out.push(dashSection('XP rules', RULE_KEYS.map((k) =>
+        `<div class="field"><label>${k}</label><input id="rule-${k}" value="${esc(c[k] ?? '')}"></div>`).join('')
+        + '<button id="rules-save">Save rules</button>'));
+      out.push(dashSection('Exclusions', `<p>Channels: ${esc((dash.exclusions?.channels || []).join(', '))}</p>
+        <p>Roles: ${esc((dash.exclusions?.roles || []).join(', '))}</p>`));
+    }
+
+    if (dashTab === 'features') {
+      out.push(dashSection('Feature toggles', FEATURE_KEYS.map((k) =>
+        `<div class="list-row"><span>${k}</span><input type="checkbox" data-feature="${k}" ${c[k] ? 'checked' : ''}></div>`).join('')
+        + '<div class="toolbar" style="margin-top:12px"><button id="features-save">Save features</button></div>'));
+    }
+
+    if (dashTab === 'welcome') {
+      out.push(dashSection('Welcome settings', `
+        <div class="field"><label>welcome_text</label><input id="cfg-welcome_text" value="${esc(c.welcome_text ?? '')}"></div>
+        <div class="field"><label>leave_text</label><input id="cfg-leave_text" value="${esc(c.leave_text ?? '')}"></div>
+        <div class="field"><label>welcome_layout (JSON)</label><textarea id="cfg-welcome_layout">${esc(JSON.stringify(c.welcome_layout || {}))}</textarea></div>
+        <div class="list-row"><span>welcome_enabled</span><input type="checkbox" id="cfg-welcome_enabled" ${c.welcome_enabled ? 'checked' : ''}></div>
+        <div class="toolbar" style="margin-top:12px"><button id="welcome-save">Save</button></div>`));
+    }
+
+    if (dashTab === 'dm') {
+      out.push(dashSection('Welcome DM', ['dm_title', 'dm_text', 'dm_footer', 'dm_color', 'dm_banner_position'].map((k) =>
+        `<div class="field"><label>${k}</label><input id="cfg-${k}" value="${esc(c[k] ?? '')}"></div>`).join('')
+        + '<button id="dm-save">Save</button>'));
+    }
+
+    if (dashTab === 'channels') {
+      out.push(dashSection('Channels', ['welcome_channel_id', 'leave_channel_id', 'levelup_channel_id', 'alert_channel_id'].map((k) =>
+        `<div class="field"><label>${k}</label><input id="cfg-${k}" value="${esc(c[k] ?? '')}"></div>`).join('')
+        + '<button id="channels-save">Save</button>'));
+    }
+
+    if (dashTab === 'staff') {
+      out.push(dashSection('Staff roles', `<div class="field"><label>Staff role IDs (comma-separated)</label>
+        <input id="staff-roles" value="${esc((c.staff_role_ids || []).join(','))}"></div><button id="staff-save">Save</button>`));
+    }
+
+    if (dashTab === 'experimental') {
+      out.push(dashSection('AI ticket helper', `<div class="list-row"><span>ai_ticket_helper_enabled</span>
+        <input type="checkbox" id="ai-enabled" ${dash.ai_enabled ? 'checked' : ''}></div>
+        <div class="toolbar" style="margin-top:12px"><button id="ai-save">Save</button><button id="ai-test">Test connection</button></div>`));
+    }
+
+    area.innerHTML = out.join('');
+    bindDashButtons();
+    bindDashForms(c);
+  }
+
+  function bindDashForms(c) {
+    const on = (sel, fn) => { const el = $(sel); if (el) el.onclick = fn; };
+    const collect = (prefix, keys) => Object.fromEntries(keys.map((k) => [k, $(`#${prefix}${k}`)?.value ?? '']));
+    const setMany = async (values) => { try { await botAction('config.set_many', { values }); } catch (e) { alert(e.message); } };
+
+    on('#tk-save', () => setMany({
+      ticket_log_channel_id: num($('#tk-log').value),
+      ticket_ping_role_ids: $('#tk-ping').value.split(',').map((s) => num(s)).filter(Boolean),
+    }));
+    on('#rules-save', () => setMany(Object.fromEntries(RULE_KEYS.map((k) => [k, num($(`#rule-${k}`).value)]))));
+    on('#features-save', () => setMany(Object.fromEntries(FEATURE_KEYS.map((k) => [k, $(`[data-feature="${k}"]`).checked]))));
+    on('#welcome-save', () => setMany({
+      welcome_text: $('#cfg-welcome_text').value,
+      leave_text: $('#cfg-leave_text').value,
+      welcome_layout: jparse($('#cfg-welcome_layout').value, {}),
+      welcome_enabled: $('#cfg-welcome_enabled').checked,
+    }));
+    on('#dm-save', () => setMany(collect('cfg-', ['dm_title', 'dm_text', 'dm_footer', 'dm_color', 'dm_banner_position'])));
+    on('#channels-save', () => setMany(Object.fromEntries(['welcome_channel_id', 'leave_channel_id', 'levelup_channel_id', 'alert_channel_id']
+      .map((k) => [k, num($(`#cfg-${k}`).value)]))));
+    on('#staff-save', () => setMany({ staff_role_ids: $('#staff-roles').value.split(',').map((s) => num(s)).filter(Boolean) }));
+    on('#ai-save', () => setMany({ ai_ticket_helper_enabled: $('#ai-enabled').checked }));
+    on('#ai-test', async () => {
+      try { const r = await botAction('ai.test', {}, false); alert(r.response || 'No response'); }
+      catch (e) { alert(e.message); }
+    });
+
+    const gwBtn = document.querySelector('[data-dash-action="__gw_new"]');
+    if (gwBtn) {
+      gwBtn.dataset.dashAction = '';
+      gwBtn.onclick = () => modalForm('New giveaway', [
+        { name: 'title', label: 'Title' }, { name: 'prize_pool', label: 'Prize pool' },
+        { name: 'body', label: 'Body', area: true, value: '{entries} entries' },
+        { name: 'channel_id', label: 'Channel ID' }, { name: 'duration', label: 'Duration (seconds)', value: '259200' },
+        { name: 'winners', label: 'Winners', value: '1' },
+        { name: 'rewards', label: 'Rewards JSON', area: true, value: '[{"name":"Prize","description":"","value":"","reward_type":"custom","secret":""}]' },
+      ], 'giveaway.create', (v) => ({
+        title: v.title, prize_pool: v.prize_pool, body: v.body, channel_id: num(v.channel_id),
+        duration: num(v.duration), interval: 86400, winners: num(v.winners), roles: [], multi: false,
+        reassign: false, claim_hours: null, rewards: jparse(v.rewards, []),
+      }));
+    }
+    const rrBtn = document.querySelector('[data-dash-action="__gw_reroll"]');
+    if (rrBtn) {
+      rrBtn.dataset.dashAction = '';
+      rrBtn.onclick = () => modalForm('Reroll giveaway winner', [
+        { name: 'giveaway_id', label: 'Giveaway ID' }, { name: 'reward_id', label: 'Reward ID' },
+      ], 'giveaway.reroll', (v) => ({ giveaway_id: num(v.giveaway_id), reward_id: num(v.reward_id) }));
+    }
+    const pollBtn = document.querySelector('[data-dash-action="__poll_new"]');
+    if (pollBtn) {
+      pollBtn.dataset.dashAction = '';
+      pollBtn.onclick = () => modalForm('New poll', [
+        { name: 'question', label: 'Question' }, { name: 'options', label: 'Options (comma-separated)' },
+        { name: 'channel_id', label: 'Channel ID' }, { name: 'seconds', label: 'Duration (0 = manual)', value: '0' },
+        { name: 'private', label: 'Private (true/false)', value: 'false' },
+      ], 'poll.create', (v) => ({
+        question: v.question, options: v.options.split(',').map((s) => s.trim()).filter(Boolean),
+        channel_id: num(v.channel_id), seconds: num(v.seconds), private: v.private.toLowerCase() === 'true',
+        role_ids: [], votes_final: false, banner_id: null,
+      }));
+    }
+    const ttBtn = document.querySelector('[data-dash-action="__tt_new"]');
+    if (ttBtn) {
+      ttBtn.dataset.dashAction = '';
+      ttBtn.onclick = () => modalForm('New ticket type', [
+        { name: 'name', label: 'Name' }, { name: 'emoji', label: 'Emoji', value: '🎫' },
+        { name: 'description', label: 'Description' },
+      ], 'tickets.type_create', (v) => ({ name: v.name, emoji: v.emoji, description: v.description }));
+    }
+    const bannerBtn = document.querySelector('[data-dash-action="__banner_set"]');
+    if (bannerBtn) {
+      bannerBtn.dataset.dashAction = '';
+      bannerBtn.onclick = () => modalForm('Set ticket banner', [
+        { name: 'which', label: 'Which (panel/ticket)', value: 'panel' },
+        { name: 'link', label: 'Image link (blank to remove when remove=true)' },
+        { name: 'remove', label: 'Remove (true/false)', value: 'false' },
+      ], 'tickets.banner_set', (v) => ({
+        which: v.which, link: v.link || null, remove: v.remove.toLowerCase() === 'true'
+      }));
+    }
+    document.querySelectorAll('[data-dash-action="__tt_edit"]').forEach((btn) => {
+      const typeId = jparse(btn.dataset.dashParams, {}).type_id;
+      btn.dataset.dashAction = '';
+      btn.onclick = () => modalForm('Edit ticket type', [
+        { name: 'name', label: 'Name' }, { name: 'emoji', label: 'Emoji' },
+        { name: 'description', label: 'Description' },
+        { name: 'enabled', label: 'Enabled (true/false)', value: 'true' },
+      ], 'tickets.type_update', (v) => ({
+        type_id: typeId, name: v.name, emoji: v.emoji, description: v.description,
+        enabled: v.enabled.toLowerCase() === 'true'
+      }));
+    });
+    const blBtn = document.querySelector('[data-dash-action="__bl_add"]');
+    if (blBtn) {
+      blBtn.dataset.dashAction = '';
+      blBtn.onclick = () => modalForm('Blacklist user', [
+        { name: 'user_id', label: 'User ID' }, { name: 'reason', label: 'Reason' },
+      ], 'tickets.blacklist_add', (v) => ({ user_id: num(v.user_id), reason: v.reason }));
+    }
+    const annBtn = document.querySelector('[data-dash-action="__ann_publish"]');
+    if (annBtn) {
+      annBtn.dataset.dashAction = '';
+      annBtn.onclick = () => modalForm('Publish announcement', [
+        { name: 'channel_id', label: 'Channel ID' }, { name: 'message', label: 'Message text (optional)' },
+        { name: 'draft', label: 'Draft JSON', area: true, value: '{"title":"Announcement","description":"Hello","color":5790199,"fields":[],"buttons":[]}' },
+      ], 'announcement.publish', (v) => ({ channel_id: num(v.channel_id), message: v.message, draft: jparse(v.draft, {}) }));
+    }
+    const schedBtn = document.querySelector('[data-dash-action="__ann_schedule"]');
+    if (schedBtn) {
+      schedBtn.dataset.dashAction = '';
+      schedBtn.onclick = () => modalForm('Schedule announcement', [
+        { name: 'channel_id', label: 'Channel ID' },
+        { name: 'publish_at', label: 'Publish at (ISO 8601)', value: new Date(Date.now() + 3600000).toISOString() },
+        { name: 'draft', label: 'Draft JSON', area: true, value: '{"title":"Announcement","description":"Hello","color":5790199,"fields":[],"buttons":[]}' },
+      ], 'announcement.schedule', (v) => ({ channel_id: num(v.channel_id), publish_at: v.publish_at, draft: jparse(v.draft, {}) }));
+    }
+    const tmplBtn = document.querySelector('[data-dash-action="__ann_template"]');
+    if (tmplBtn) {
+      tmplBtn.dataset.dashAction = '';
+      tmplBtn.onclick = () => modalForm('Save announcement template', [
+        { name: 'name', label: 'Template name' },
+        { name: 'draft', label: 'Draft JSON', area: true, value: '{"title":"Announcement","description":"Hello","color":5790199,"fields":[],"buttons":[]}' },
+      ], 'announcement.template_save', (v) => ({ name: v.name, draft: jparse(v.draft, {}) }));
+    }
+    const xpBtn = document.querySelector('[data-dash-action="__xp_adjust"]');
+    if (xpBtn) {
+      xpBtn.dataset.dashAction = '';
+      xpBtn.onclick = () => modalForm('Adjust member XP', [
+        { name: 'member_id', label: 'Member ID' },
+        { name: 'mode', label: 'Mode (add/remove/set/reset)', value: 'add' },
+        { name: 'amount', label: 'Amount', value: '0' },
+      ], 'xp.adjust', (v) => ({ member_id: num(v.member_id), mode: v.mode, amount: num(v.amount) }));
+    }
+    const exBtn = document.querySelector('[data-dash-action="__xp_exclude"]');
+    if (exBtn) {
+      exBtn.dataset.dashAction = '';
+      exBtn.onclick = () => modalForm('Set XP exclusion', [
+        { name: 'kind', label: 'Kind (channel/role)', value: 'channel' },
+        { name: 'target_id', label: 'Target ID' },
+        { name: 'excluded', label: 'Excluded (true/false)', value: 'true' },
+      ], 'exclusions.set', (v) => ({ kind: v.kind, target_id: num(v.target_id), excluded: v.excluded.toLowerCase() === 'true' }));
+    }
+  }
+
+  async function renderDiscordAdmin() {
+    content.innerHTML = '<div class="toolbar"><select id="dash-tab"></select></div><div id="dash-area"><p class="muted">Loading…</p></div>';
+    try { dash = await api('/api/dashboard'); }
+    catch (err) {
+      $('#dash-area').innerHTML = `<div class="error">${esc(err.message || err)}</div>`;
+      return;
+    }
+    $('#dash-tab').innerHTML = DASH_TABS.map((t) =>
+      `<option value="${t}" ${t === dashTab ? 'selected' : ''}>${t[0].toUpperCase() + t.slice(1)}</option>`).join('');
+    $('#dash-tab').onchange = (e) => { dashTab = e.target.value; drawDashTab(); };
+    drawDashTab();
+  }
+
   const renderers = {
     overview: renderOverview, database: renderDatabase, config: renderConfig,
     migrations: renderMigrations, containers: renderContainers, backups: renderBackups, api: renderApi

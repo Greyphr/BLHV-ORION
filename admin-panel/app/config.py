@@ -44,6 +44,8 @@ class Config:
     compose_project: str
     backups_dir: str
     api_token: str
+    bot_rpc_url: str
+    bot_rpc_token: str
     session_hours: int
     secure_cookies: bool
     allow_writes: bool
@@ -84,6 +86,8 @@ class Config:
             compose_project=os.getenv("COMPOSE_PROJECT", "orion"),
             backups_dir=os.getenv("BACKUPS_DIR", "/backups"),
             api_token=os.getenv("ADMIN_API_TOKEN", "").strip(),
+            bot_rpc_url=os.getenv("BOT_RPC_URL", "http://bot:8082").strip().rstrip("/"),
+            bot_rpc_token=os.getenv("BOT_RPC_TOKEN", "").strip(),
             session_hours=_int("SESSION_HOURS", 8),
             secure_cookies=_bool("COOKIE_SECURE"),
             allow_writes=_bool("ADMIN_ALLOW_WRITES", True),

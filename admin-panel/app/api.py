@@ -15,6 +15,12 @@ from .security import Principal
 
 log = logging.getLogger("orion.admin.api")
 
+READ_ACTIONS = frozenset({"tickets.stats", "ai.test"})
+CONTROL_ACTIONS = frozenset({
+    "xp.resync_roles", "tickets.setup", "giveaway.end", "giveaway.cancel",
+    "giveaway.reroll", "poll.delete",
+})
+
 
 def _principal(request: web.Request) -> Principal:
     return request["principal"]
@@ -32,6 +38,15 @@ def _docker(request: web.Request) -> DockerControl:
     return request.app["docker"]
 
 
+def _bot(request: web.Request):
+    return request.app["bot_rpc"]
+
+
+def _actor_id(request: web.Request) -> str:
+    user_id = _principal(request).user_id
+    return user_id if user_id.isdigit() else _config(request).owner_id
+
+
 def _require(request: web.Request, permission: str) -> None:
     if not _principal(request).has(permission):
         raise web.HTTPForbidden(reason=f"Permission {permission} required")
@@ -43,6 +58,10 @@ def _json(data: Any, *, status: int = 200) -> web.Response:
 
 def _error(message: str, status: int = 400) -> web.Response:
     return _json({"error": message}, status=status)
+
+
+def _cache_owned(name: str) -> bool:
+    return name in {"config", "xp_exclusions"}
 
 
 async def health(request: web.Request) -> web.Response:
@@ -107,6 +126,8 @@ async def table_rows(request: web.Request) -> web.Response:
 
 async def insert_row(request: web.Request) -> web.Response:
     _require(request, "write")
+    if _cache_owned(request.match_info["name"]):
+        return _error("This table is cached by the bot; use the dedicated admin actions", 403)
     if not _config(request).allow_writes:
         return _error("Writes are disabled", 403)
     body = await request.json()
@@ -122,6 +143,8 @@ async def insert_row(request: web.Request) -> web.Response:
 
 async def update_row(request: web.Request) -> web.Response:
     _require(request, "write")
+    if _cache_owned(request.match_info["name"]):
+        return _error("This table is cached by the bot; use the dedicated admin actions", 403)
     if not _config(request).allow_writes:
         return _error("Writes are disabled", 403)
     body = await request.json()
@@ -139,6 +162,8 @@ async def update_row(request: web.Request) -> web.Response:
 
 async def delete_row(request: web.Request) -> web.Response:
     _require(request, "write")
+    if _cache_owned(request.match_info["name"]):
+        return _error("This table is cached by the bot; use the dedicated admin actions", 403)
     if not _config(request).allow_writes:
         return _error("Writes are disabled", 403)
     body = await request.json()
@@ -165,13 +190,35 @@ async def config_set(request: web.Request) -> web.Response:
     key = request.match_info["key"]
     if not key or len(key) > 200:
         return _error("Invalid config key")
-    await _db(request).config_set(key, body.get("value"))
-    log.info(
-        "AUDIT user=%s config_set key=%s (bot requires restart to reload)",
-        _principal(request).user_id,
-        key,
+    result = await _bot(request).action(
+        "config.set_many", {"values": {key: body.get("value")}}, _actor_id(request)
     )
-    return _json({"key": key, "value": body.get("value"), "restart_required": True})
+    log.info("AUDIT user=%s config_set key=%s via bot RPC", _principal(request).user_id, key)
+    return _json({"key": key, "value": body.get("value"), "changed": result.get("changed", []), "restart_required": False})
+
+
+async def dashboard(request: web.Request) -> web.Response:
+    _require(request, "read")
+    return _json(await _bot(request).snapshot(_actor_id(request)))
+
+
+async def bot_capabilities(request: web.Request) -> web.Response:
+    _require(request, "read")
+    return _json({"actions": await _bot(request).capabilities()})
+
+
+async def bot_action(request: web.Request) -> web.Response:
+    body = await request.json()
+    name = str(body.get("action", ""))
+    if not name:
+        return _error("action is required")
+    required = "read" if name in READ_ACTIONS else ("control" if name in CONTROL_ACTIONS else "write")
+    _require(request, required)
+    if required != "read" and not _config(request).allow_writes:
+        return _error("Writes are disabled", 403)
+    result = await _bot(request).action(name, body.get("params") or {}, _actor_id(request))
+    log.info("AUDIT user=%s bot_action=%s", _principal(request).user_id, name)
+    return _json({"result": result})
 
 
 async def migrations(request: web.Request) -> web.Response:
@@ -251,6 +298,9 @@ def setup_api(app: web.Application) -> None:
     app.router.add_get("/api/health", health)
     app.router.add_get("/api/me", me)
     app.router.add_get("/api/overview", overview)
+    app.router.add_get("/api/dashboard", dashboard)
+    app.router.add_get("/api/bot/capabilities", bot_capabilities)
+    app.router.add_post("/api/bot/action", bot_action)
     app.router.add_get("/api/tables", tables)
     app.router.add_get("/api/tables/{name}", table_rows)
     app.router.add_post("/api/tables/{name}", insert_row)

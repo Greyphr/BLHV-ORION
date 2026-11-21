@@ -21,7 +21,11 @@ A standalone admin web panel and REST API for Orion. It runs in **its own Docker
 - Optional bearer token (`ADMIN_API_TOKEN`) for API clients.
 - Mounting `/var/run/docker.sock` grants host-level Docker control. Keep the port host-only and restrict who can log in.
 
-## Setup
+## Discord `/admin` parity
+
+The **Discord Admin** page mirrors the bot's `/admin` panel: giveaways, polls, tickets, announcements, XP, features, welcome/DM text, channels, staff access and the AI experiment. It talks to the running bot through an authenticated internal RPC service (`http://bot:8082`), so the web container never receives the Discord bot token.
+
+`BOT_RPC_TOKEN` must be identical in `C:\Orion-Production\.env` and `admin.env`. The RPC port is never published to the host, and every write is re-checked against the acting Discord user's admin/staff roles inside the bot.
 
 ### 1. Use your existing Orion Discord application
 

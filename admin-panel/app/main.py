@@ -11,6 +11,7 @@ import aiohttp
 from aiohttp import web
 
 from .api import setup_api
+from .bot_rpc import BotRPC
 from .config import Config
 from .database import AdminDB
 from .discord_oauth import DiscordOAuth
@@ -159,6 +160,7 @@ async def startup(app: web.Application) -> None:
         connector=aiohttp.UnixConnector(path=config.docker_socket)
     )
     app["oauth"] = DiscordOAuth(config, app["http"])
+    app["bot_rpc"] = BotRPC(config, app["http"])
     app["docker"] = DockerControl(config.docker_socket, config.compose_project, app["docker_http"])
     app["db"] = AdminDB(config.database_url)
     await app["db"].connect()

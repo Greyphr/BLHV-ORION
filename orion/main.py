@@ -8,7 +8,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from . import alerts, config, health, voice_debug
+from . import alerts, bot_rpc, config, health, voice_debug
 from .db import Database
 from .ui import PanelView
 
@@ -97,6 +97,13 @@ async def main():
                 port=int(os.getenv("HEALTH_PORT", "8080")),
             )
             await health_server.start()
+            rpc_server = bot_rpc.BotRPCServer(
+                bot,
+                host=os.getenv("BOT_RPC_HOST", "0.0.0.0"),
+                port=int(os.getenv("BOT_RPC_PORT", "8082")),
+                token=os.getenv("BOT_RPC_TOKEN", ""),
+            )
+            await rpc_server.start()
             bot_task = asyncio.create_task(bot.start(config.TOKEN), name="orion-discord")
             stop_task = asyncio.create_task(stop.wait(), name="orion-shutdown")
             try:
@@ -113,6 +120,7 @@ async def main():
                 with suppress(asyncio.CancelledError):
                     await stop_task
                 await health_server.stop()
+                await rpc_server.stop()
     finally:
         for sig in registered_signals:
             with suppress(NotImplementedError):

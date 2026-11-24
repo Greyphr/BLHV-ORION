@@ -101,12 +101,40 @@ BETA_KEYS_CHANNEL_ID = _int_env("BETA_KEYS_CHANNEL_ID", 0)   # Beta Testers may 
 BETA_KEYS_PER_TESTER = max(1, _int_env("BETA_KEYS_PER_TESTER", 3))
 BETA_KEYS_LOG_CHANNEL_ID = _int_env("BETA_KEYS_LOG_CHANNEL_ID", 0)
 
+_DATA_ROOT = Path(os.getenv("DATA_DIR", "data")).resolve()
+GENERATED_DIR = _DATA_ROOT / "generated"          # the active generated feature files (rebuilt from the database at startup)
+SNAPSHOT_DIR = _DATA_ROOT / "backups"             # data-only snapshots taken before a generated feature changes the database
+
 # ---- Experimental: AI ticket handler (switch it on/off with /ai switch; tune it with /ai set) ----
 # Any cloud LLM: AI_PROVIDER=gemini (default), anthropic, or openai (also any OpenAI-compatible service via AI_BASE_URL).
 AI_PROVIDER = os.getenv("AI_PROVIDER", "gemini").strip().lower() or "gemini"
 AI_API_KEY = os.getenv("AI_API_KEY", "").strip()
 AI_MODEL = os.getenv("AI_MODEL", "").strip() or {"gemini": "gemini-2.5-flash", "anthropic": "claude-haiku-5-5"}.get(AI_PROVIDER, "gpt-4o-mini")
 AI_BASE_URL = os.getenv("AI_BASE_URL", "").strip()
+
+
+def _load_ai_fallbacks() -> list[dict]:
+    """AI_FALLBACK_1_* ... AI_FALLBACK_6_*: extra AI providers tried, in this order, when the main one fails. A numbered block with
+    nothing filled in is ignored; a half-filled one is kept so the bot can say what is missing (see ai.chain)."""
+    out = []
+    for n in range(1, 7):
+        v = {f: os.getenv(f"AI_FALLBACK_{n}_{f.upper()}", "").strip() for f in ("name", "kind", "key", "model", "base_url")}
+        if not any(v.values()):
+            continue
+        out.append({"index": n, "name": (v["name"] or f"fallback{n}").lower(), "kind": (v["kind"] or "openai").lower(),
+                    "key": v["key"], "model": v["model"], "base_url": v["base_url"]})
+    return out
+
+
+AI_FALLBACKS = _load_ai_fallbacks()
+
+# ---- Build harness (/build, Sect Patriarch only): the AI writes a new feature, you review it, the bot loads it live ----
+# Uses the same AI_PROVIDER / AI_API_KEY as above. Code writing needs a stronger model than ticket answers, so BUILDER_MODEL can
+# override AI_MODEL for /build only (blank = AI_MODEL). Generated code and the pre-change database snapshots live under DATA_DIR.
+BUILDER_MODEL = os.getenv("BUILDER_MODEL", "").strip()
+BUILDER_MAX_TOKENS = 16000          # room for a whole cog file (Gemini counts its "thinking" tokens against this too)
+BUILDER_TIMEOUT_SECONDS = 240       # writing a cog takes far longer than answering a ticket
+BUILDER_SNAPSHOTS_KEEP = 10         # how many pre-change database snapshots to keep on disk
 
 # ---- Music (ported from the Sarada bot) ----
 MUSIC_MAX_PLAYLIST = 1000       # cap on tracks pulled from one playlist

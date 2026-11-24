@@ -1,5 +1,7 @@
 """/ai: manage Orion's AI ticket handler (Sect Admin only): switch, settings, knowledge base, logs, test."""
+import asyncio
 import logging
+import time
 
 import discord
 from discord import app_commands
@@ -15,6 +17,10 @@ log = logging.getLogger("orion.ai.admin")
 SETTING_CHOICES = ["tone", "length", "personality", "confidence", "auto-close", "max-replies", "ping-staff",
                    "model", "human-only-types"]
 KIND_ICON = {"reply": "💬", "escalate": "🙋", "close": "✅", "error": "⚠️", "skip": "⏭️", "handoff": "🤝"}
+
+
+def _ago(seconds: float) -> str:
+    return f"{int(seconds)}s" if seconds < 90 else (f"{int(seconds // 60)}m" if seconds < 5400 else f"{int(seconds // 3600)}h")
 
 
 class KnowledgeModal(discord.ui.Modal):
@@ -42,9 +48,21 @@ class KnowledgeModal(discord.ui.Modal):
 
 class AIAdmin(commands.GroupCog, name="ai", description="Orion's AI ticket handler (Sect Admin)"):
     kb = app_commands.Group(name="kb", description="The approved knowledge base the AI may answer from")
+    provider = app_commands.Group(name="provider", description="Which AI service answers, and the backups if it is down")
 
     def __init__(self, bot):
         self.bot = bot
+
+    async def cog_load(self):
+        """Restore the provider pinned with /ai provider use, and log any fallback in .env that was skipped."""
+        for problem in ai.chain()[1]:
+            log.warning("AI config: %s", problem)
+        try:
+            pinned = self.bot.db.get(ai.PREFERRED_KEY, None)
+            if pinned:
+                ai.set_preferred(pinned)
+        except ValueError:
+            log.warning("The pinned AI provider '%s' is no longer in .env, so the normal order is used.", pinned)
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         return await require_admin(interaction)
@@ -62,7 +80,15 @@ class AIAdmin(commands.GroupCog, name="ai", description="Orion's AI ticket handl
         e = discord.Embed(title="🤖 AI ticket handler", color=config.COLOR_MAIN,
                           description=f"**{'✅ ON' if s.enabled else '❌ OFF'}** · experimental · "
                                       f"{'API key set' if ai.is_configured() else '⚠️ no `AI_API_KEY` in `.env`'}")
-        e.add_field(name="Model", value=f"`{config.AI_PROVIDER}` · `{s.model or config.AI_MODEL}`", inline=False)
+        providers, _ = ai.chain()
+        nxt = ai.active_provider()
+        if nxt is None:
+            model_line = f"`{config.AI_PROVIDER}` · `{s.model or config.AI_MODEL}`"
+        else:
+            model_line = f"`{nxt.name}` · `{(s.model or nxt.model) if nxt.primary else nxt.model}`"
+            if len(providers) > 1:
+                model_line += f" (+{len(providers) - 1} backup{'s' if len(providers) > 2 else ''}: `/ai provider list`)"
+        e.add_field(name="Model", value=model_line, inline=False)
         e.add_field(name="Tone / length", value=f"{s.tone} / {s.length} (max {s.max_chars} chars)", inline=True)
         e.add_field(name="Confidence needed", value=f"{s.confidence:.0%}", inline=True)
         e.add_field(name="Auto-close routine tickets", value="on" if s.auto_close else "off", inline=True)
@@ -101,6 +127,76 @@ class AIAdmin(commands.GroupCog, name="ai", description="Orion's AI ticket handl
         await self.db.set(key, parsed)
         await self.db.record_audit(i.user.id, "ai.set", "config", key, value=parsed)
         await i.response.send_message(f"✅ **{setting.value}** is now `{parsed}`.", ephemeral=True)
+
+    # ---------------------------------------------------------- AI providers
+    @provider.command(name="list", description="The AI services, which one is tried first, and which are having trouble")
+    async def provider_list(self, i: discord.Interaction):
+        providers, problems = ai.chain()
+        if not providers:
+            return await i.response.send_message("⚠️ No AI provider is set up. Add `AI_API_KEY` to `.env` and restart the bot.\n"
+                                                 + "\n".join(problems), ephemeral=True)
+        pinned = ai.get_preferred()
+        lines = []
+        for st in ai.provider_status():
+            mark = "▶️" if st["next"] else "▫️"
+            if st["cooling_for"] > 0:
+                state = f"⚠️ having trouble, skipped for {int(st['cooling_for'])}s more: {st['last_error'][:110]}"
+            elif st["last_ok_ago"] is not None:
+                state = f"✅ last worked {_ago(st['last_ok_ago'])} ago"
+            else:
+                state = "no requests yet"
+            tags = " 📌pinned" if st["pinned"] else ""
+            lines.append(f"{mark} **{st['name']}**{tags} · {st['kind']} · `{st['model']}`\n　{state}")
+        e = discord.Embed(title="🤖 AI providers", color=config.COLOR_MAIN, description="\n".join(lines))
+        e.add_field(name="Order", inline=False,
+                    value=(f"Pinned to **{pinned}** first, then the others." if pinned else "Automatic: the order in `.env`.")
+                    + " If the first one fails, the next answers. A failing one is skipped for a minute (ten for a bad key).")
+        if problems:
+            e.add_field(name="Skipped (fix in .env)", value="\n".join(problems)[:1000], inline=False)
+        await i.response.send_message(embed=e, ephemeral=True)
+
+    @provider.command(name="use", description="Pin one AI service to be tried first, or go back to automatic")
+    @app_commands.describe(name="A provider from /ai provider list, or 'auto'")
+    async def provider_use(self, i: discord.Interaction, name: str):
+        name = name.strip().lower()
+        try:
+            ai.set_preferred(name)
+        except ValueError as e:
+            return await i.response.send_message(f"⚠️ {e} See `/ai provider list`.", ephemeral=True)
+        await self.db.set(ai.PREFERRED_KEY, name)        # "auto" is stored as is: the config table has no NULLs
+        await self.db.record_audit(i.user.id, "ai.provider.use", "config", ai.PREFERRED_KEY, provider=name)
+        await i.response.send_message("✅ Back to the automatic order." if name == "auto" else
+                                      f"✅ **{name}** is tried first now. If it fails, the others still step in. "
+                                      "`/ai provider use auto` undoes this.", ephemeral=True)
+
+    @provider_use.autocomplete("name")
+    async def _provider_ac(self, i: discord.Interaction, current: str):
+        names = ["auto"] + [p.name for p in ai.chain()[0]]
+        return [app_commands.Choice(name=n, value=n) for n in names if current.lower() in n][:25]
+
+    @provider.command(name="test", description="Send a tiny test message to one AI service (or all) to check the key works")
+    @app_commands.describe(name="Which one (blank = all of them)")
+    async def provider_test(self, i: discord.Interaction, name: str | None = None):
+        providers, _ = ai.chain()
+        targets = [p.name for p in providers if not name or p.name == name.strip().lower()]
+        if not targets:
+            return await i.response.send_message("⚠️ There is no AI provider with that name. See `/ai provider list`.",
+                                                 ephemeral=True)
+        await i.response.defer(ephemeral=True, thinking=True)
+
+        async def one(n: str) -> str:
+            t0 = time.monotonic()
+            try:
+                out = await ai.complete("Reply with the single word OK.", "ping", max_tokens=20, only=n)
+                return f"✅ **{n}** answered in {time.monotonic() - t0:.1f}s: `{out[:40]}`"
+            except ai.AIError as e:
+                return f"❌ **{n}**: {e}"
+
+        await i.followup.send("\n".join(await asyncio.gather(*(one(n) for n in targets))), ephemeral=True)
+
+    @provider_test.autocomplete("name")
+    async def _provider_test_ac(self, i: discord.Interaction, current: str):
+        return [app_commands.Choice(name=p.name, value=p.name) for p in ai.chain()[0] if current.lower() in p.name][:25]
 
     # ---------------------------------------------------------- knowledge base
     @kb.command(name="add", description="Add an approved fact or answer")

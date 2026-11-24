@@ -69,3 +69,15 @@ async def require_keys_manager(interaction: discord.Interaction) -> bool:
     if is_keys_manager(interaction.user):
         return True
     raise app_commands.CheckFailure(f"Only **{config.ADMIN_ROLE_NAME}** and the beta key manager roles can use this.")
+
+
+def is_patriarch(user) -> bool:
+    """Only the OWNER_ID account (the Sect Patriarch). Deliberately NOT the Sect Admin role and NOT the server owner flag:
+    /build adds code that runs inside the bot, so it is the narrowest permission in the bot."""
+    return user.id == config.OWNER_ID
+
+
+async def require_patriarch(interaction: discord.Interaction) -> bool:
+    if is_patriarch(interaction.user):
+        return True
+    raise app_commands.CheckFailure("Only the Sect Patriarch can use the build tools.")

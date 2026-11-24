@@ -11,6 +11,7 @@ from .announce_templates import BUILTIN_TEMPLATES
 from .achievement_db import AchievementStore
 from .ai_db import AiStore
 from .audit_db import AuditStore
+from .builder_db import BuilderStore
 from .event_db import EventStore
 from .giveaway_db import GiveawayStore
 from .keys_db import KeyStore
@@ -35,7 +36,7 @@ class Award(NamedTuple):
     bonus: int = 0
 
 
-class Database(AuditStore, ModStore, AiStore, AchievementStore, EventStore, GiveawayStore, PollStore, TicketStore, KeyStore):
+class Database(AuditStore, BuilderStore, ModStore, AiStore, AchievementStore, EventStore, GiveawayStore, PollStore, TicketStore, KeyStore):
     def __init__(self, dsn: str):
         self.dsn = dsn
         self.pool: Optional[asyncpg.Pool] = None

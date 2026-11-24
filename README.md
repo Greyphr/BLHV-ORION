@@ -27,7 +27,9 @@ including `/xp`. The **Staff** role (`STAFF_ROLE_IDS`) gets the staff commands a
 11. [Polls](#polls)
 12. [Tickets](#tickets)
 13. [Music](#music)
-14. [Maintenance](#maintenance)
+14. [The build harness](#the-build-harness-build)
+15. [AI providers and the switcher](#ai-providers-and-the-switcher)
+16. [Maintenance](#maintenance)
 
 ## Setup
 
@@ -91,9 +93,11 @@ Settings live in `.env`. Only the first three are required.
 | `COOKIES_FILE` | Optional, only if YouTube starts refusing to play videos. See [Music](#music) |
 | `AUTO_UPDATE_YTDLP` | Optional. Set to `0` to stop the bot upgrading yt-dlp on every start. Default `1` |
 | `AI_API_KEY` | **Experimental.** Google Gemini API key (https://aistudio.google.com/apikey) for the AI ticket handler. Empty = the handler can't be turned on |
+| `AI_FALLBACK_1_*` to `AI_FALLBACK_6_*` | Backup AI services, tried in order when the main one fails. See [AI providers and the switcher](#ai-providers-and-the-switcher) |
 | `AI_PROVIDER` | `gemini` (default), `anthropic` or `openai` (also any OpenAI-compatible service with `AI_BASE_URL`) |
 | `AI_MODEL` | Model name. Blank = `gemini-2.5-flash` (Gemini default) |
 | `AI_BASE_URL` | Optional custom endpoint |
+| `BUILDER_MODEL` | Model used by `/build` to write code (blank = `AI_MODEL`). Pick a strong coding model: Gemini Flash is fine for tickets but weak at writing cogs |
 
 ## Commands
 
@@ -116,6 +120,7 @@ Settings live in `.env`. Only the first three are required.
 | Sect Admin only | `/ticket setup` |
 | Sect Admin / Patriarch only (Sect Admin can't use these) | `/realguys`, `/xp add`, `remove`, `set`, `reset`, `exclude-channel`, `include-channel`, `exclude-role`, `include-role`, `exclusions`, `resync-roles` |
 | Sect Admin only | `/setup` |
+| Sect Patriarch only (`OWNER_ID`, not even Sect Admin) | `/build new`, `modify`, `list`, `history`, `show`, `rollback`, `disable`, `enable`. See [The build harness](#the-build-harness-build) |
 
 Staff roles are chosen in `/admin` under Staff access. If you want the admin commands hidden from everyone else, go to
 Server Settings, Integrations, pick the bot, and restrict them there.
@@ -592,6 +597,96 @@ contains ffmpeg and Deno, which yt-dlp needs to solve YouTube's challenges.
 
 **If every video still fails**, export your YouTube cookies in Netscape format, save them as `data/cookies.txt`, set `COOKIES_FILE=data/cookies.txt`
 in `.env` and run `docker compose up -d --build`. A cookie file is a login session, so keep it private. `*cookies*` is already in `.gitignore`.
+
+## The build harness (/build)
+
+Sect Patriarch only. Describe a feature in plain words and the AI writes it as a new cog file. You read the code in Discord, approve
+it, and the bot loads it live, with no rebuild. If anything breaks, the previous version is put back. Needs `AI_API_KEY`
+(same provider settings as the ticket AI; set `BUILDER_MODEL` to a strong coding model).
+
+```
+/build new request: Make a #choose-your-role channel with a role menu. Create one role per Marvel Rivals ranked tier.
+```
+
+1. The AI writes the feature. A private message shows its summary, the assumptions you should check, any new database tables, and the
+   **code as an attached file**.
+2. **Approve & load** loads it into the running bot. **Request changes** opens a box where you tell the AI what to fix; you get a new
+   version to review. **Reject** throws it away. Nothing runs until you press Approve.
+3. The buttons keep working after a restart. `/build show build:<number>` brings a draft back.
+
+| Command | What it does |
+|---|---|
+| `/build new` | The AI writes a new feature for you to review |
+| `/build modify feature request` | The AI changes an existing feature (it is given the current code). A draft that was waiting is replaced |
+| `/build list` | Features, whether they're running, and drafts waiting for you |
+| `/build history feature` | Every version and what happened to it |
+| `/build show build` | Open any version's code (with buttons if it's still waiting) |
+| `/build rollback feature [version]` | Go back to the previous version that actually ran, or to a version you pick |
+| `/build disable` / `/build enable` | Switch a feature off or on. Its data is kept |
+
+### How it stays safe
+
+* **A bad version can't take the bot down.** The feature is loaded inside a guard. If it fails to load, or Discord refuses its slash
+  commands, the previous version is loaded again and the bad one is marked *failed*. A first version that fails simply stays
+  unloaded. Nothing else in the bot is touched.
+* **Startup is guarded too.** At every start the bot rebuilds the feature files from the database and loads them one by one. A feature
+  that no longer loads falls back to its previous working version, or is switched off, and staff get a message in the alerts channel.
+* **Version history.** Every version is kept in the database (`builder_builds`), with who asked for it and what the AI assumed.
+  `/build rollback` makes an older one live again.
+* **Database backup first.** A feature can only add its **own new tables**, named `gen_<name>` or `gen_<name>_...`, and only with
+  `CREATE TABLE/INDEX IF NOT EXISTS`. Before those are created, a data snapshot of **every** table is written to
+  `data/backups/prebuild-<time>-b<build>/` (one `.csv.gz` per table, last 10 kept). If the snapshot fails, nothing is changed. If the
+  SQL fails, it is undone. Restoring a table: empty it, then `\copy <table> FROM PROGRAM 'gunzip -c <table>.csv.gz' CSV HEADER`.
+  This is on top of the nightly full `pg_dump` in `backups/`.
+* **Only you.** Every command and button checks for `OWNER_ID`. The Sect Admin role and the server-owner flag do not count.
+  Every build, approval, rollback and switch is written to the audit log.
+
+### What it does NOT protect you from
+
+* **Your review is the real gate.** An approved feature runs inside the bot with the same access as the bot (its token, the whole
+  database). The harness limits what the AI is *told* to do, but it does not scan or sandbox the code. Read the attached file, and
+  be suspicious of anything that touches `os`, `subprocess`, environment variables, network calls, or tables that aren't `gen_...`.
+* **A feature that loads fine but misbehaves** (for example a command that errors, or one that posts the wrong thing) is not
+  switched off automatically. Use `/build disable` or `/build rollback`.
+* New tables are kept when you roll back or disable (the older code simply ignores them). Drop them by hand if you want them gone.
+
+Generated code lives in the database; `data/generated/` is a copy rewritten at every start, so you don't need to back it up.
+
+## AI providers and the switcher
+
+Every AI feature (ticket helper, the `/ai test`, the dashboard test, `/build`) goes through one provider list. If the provider being
+used fails (Gemini's "high demand" 503, a rate limit, a timeout, an expired key), the **next one answers instead**, and the member
+never sees the error. A provider that just failed is skipped for a minute (ten minutes for a bad key or model name) so the next
+requests don't each wait for it. If it is the **only** provider, a busy answer is retried once.
+
+Set up backups in `.env` (numbered 1 to 6, tried in that order after the main `AI_PROVIDER` / `AI_API_KEY`):
+
+```
+AI_FALLBACK_1_NAME=groq
+AI_FALLBACK_1_KIND=openai
+AI_FALLBACK_1_KEY=<the key>
+AI_FALLBACK_1_MODEL=<a model from the provider's list>
+AI_FALLBACK_1_BASE_URL=https://api.groq.com/openai/v1
+```
+
+`KIND` is `openai` for any OpenAI-compatible service (Groq, OpenRouter, DeepSeek, Mistral, Together), or `gemini` / `anthropic`.
+A second Gemini key from a different Google project is also a useful backup, since quotas are per project. Keys live only in `.env`
+(never typed into Discord); after editing it, run `docker compose up -d` so the bot restarts with them.
+
+| Command (Sect Admin) | What it does |
+|---|---|
+| `/ai provider list` | The providers in the order they'll be tried, which is having trouble, and any `.env` block that was skipped and why |
+| `/ai provider use <name>` | Pin one to be tried first (it survives restarts). The others still step in if it fails. `auto` goes back to the `.env` order |
+| `/ai provider test [name]` | Sends a tiny message to each provider on its own (no fallback) to check its key and model |
+
+Things to know:
+
+* `/ai set model` and `BUILDER_MODEL` name a model for the **main** provider only. A backup always uses the `MODEL` in its own block.
+* A backup answers with its own model, so wording and quality differ from the main one. For `/build`, a weaker backup model writes
+  weaker code, and a service with a low output limit may refuse the long request and be skipped. You read the code before approving
+  either way.
+* A skipped block (no key, no model, unknown kind...) is logged at startup and shown at the bottom of `/ai provider list`. It never
+  stops the bot.
 
 ## Maintenance
 

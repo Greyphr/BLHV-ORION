@@ -26,6 +26,8 @@ class OrionBot(commands.Bot):
                          activity=activity, status=discord.Status.online)
         self.db = Database(config.DATABASE_URL)
         self.failed_extensions: list[str] = []
+        self.builder = None                     # the /build runtime (set in setup_hook)
+        self.builder_problems: list[str] = []   # generated features that were rolled back or switched off at startup
 
     async def setup_hook(self):
         await self.db.connect()
@@ -34,13 +36,20 @@ class OrionBot(commands.Bot):
                     "orion.cogs.giveaway", "orion.cogs.poll", "orion.cogs.ticket", "orion.cogs.twitch",
                     "orion.cogs.music", "orion.cogs.keys", "orion.cogs.dashboard", "orion.cogs.events",
                     "orion.cogs.profile", "orion.cogs.achievements", "orion.cogs.ai_admin",
-                    "orion.cogs.moderation"):
+                    "orion.cogs.moderation", "orion.cogs.builder"):
             try:
                 await self.load_extension(ext)
             except Exception:
                 self.failed_extensions.append(ext)
                 log.exception("Could not load %s. The bot is starting WITHOUT it.", ext)
         self.add_view(PanelView(self))
+        # Features written with /build load last, one by one. A broken one is rolled back or switched off, never fatal.
+        try:
+            from .builder_runtime import BuildRuntime
+            self.builder = BuildRuntime(self)
+            self.builder_problems = await self.builder.load_all()
+        except Exception:
+            log.exception("The build tools could not start. The bot is starting WITHOUT /build features.")
 
         @self.tree.error
         async def on_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
@@ -61,6 +70,12 @@ class OrionBot(commands.Bot):
 
     async def on_ready(self):
         log.info("Logged in as %s", self.user)
+        if self.builder_problems and not getattr(self, "_told_builder", False):
+            self._told_builder = True
+            guild = self.get_guild(config.GUILD_ID)
+            if guild:
+                await alerts.alert_staff(self, guild, "Build harness: " + " ".join(self.builder_problems),
+                                         key="builder-startup")
         if self.failed_extensions and not getattr(self, "_told_staff", False):
             self._told_staff = True
             guild = self.get_guild(config.GUILD_ID)

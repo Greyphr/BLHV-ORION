@@ -154,6 +154,15 @@ class BuildRuntime:
         prune_snapshots(self.snap_dir, config.BUILDER_SNAPSHOTS_KEEP)
         return dest
 
+    async def _mark_failed(self, build, error: str) -> None:
+        """Only a draft that was never loaded becomes 'failed'. A version that already ran (rollback / enable) keeps its status:
+        it is a known-good rollback target, and a hiccup now (say Discord rejecting the command sync) must not strike it off."""
+        if build["status"] == "pending":
+            await self.db.bb_set_status(build["id"], "failed", error)
+        else:
+            log.warning("Build #%s (%s) could not be loaded this time, but it ran before so its status is unchanged: %s",
+                        build["id"], build["status"], error)
+
     # --------------------------------------------------------------- activate
     async def activate(self, build_id: int, actor_id: Optional[int], *, run_schema: bool = True) -> Result:
         """Make a build the live version of its feature. Used for approving a new draft and for rolling back.
@@ -179,7 +188,7 @@ class BuildRuntime:
                 try:
                     statements = validate_schema(build["schema_sql"], slug)
                 except DraftError as e:
-                    await db.bb_set_status(build_id, "failed", str(e))
+                    await self._mark_failed(build, str(e))
                     return Result(False, f"The database changes were refused, so nothing was changed: {e}")
                 try:
                     snapshot = await self.take_snapshot(build_id)
@@ -193,7 +202,7 @@ class BuildRuntime:
                             await c.execute(st)
                 except Exception as e:
                     log.exception("Generated schema failed")
-                    await db.bb_set_status(build_id, "failed", f"database: {e}"[:1500])
+                    await self._mark_failed(build, f"database: {e}"[:1500])
                     return Result(False, f"The database changes failed and were undone. Nothing else was touched. "
                                          f"Reason: {e}"[:1500], snapshot)
 
@@ -205,7 +214,7 @@ class BuildRuntime:
                 log.exception("Loading generated feature %s failed", name)
                 err = f"{type(e).__name__}: {e}"
                 outcome = await self._restore(slug, prev, was_loaded)
-                await db.bb_set_status(build_id, "failed", err[:1500])
+                await self._mark_failed(build, err[:1500])
                 return Result(False, f"It failed to load: `{err[:600]}`\n{outcome}", snapshot)
 
             # 3. bookkeeping

@@ -73,7 +73,7 @@ def split_sections(text: str) -> dict[str, str]:
     return out
 
 
-def validate_code(code: str) -> None:
+def validate_code(code: str, slug: Optional[str] = None) -> None:
     if not code.strip():
         raise DraftError("The CODE section is empty.")
     if len(code) > MAX_CODE_CHARS:
@@ -85,6 +85,93 @@ def validate_code(code: str) -> None:
         raise DraftError(f"The code has a syntax error on line {e.lineno}: {e.msg}.") from e
     if not any(isinstance(n, ast.AsyncFunctionDef) and n.name == "setup" for n in tree.body):
         raise DraftError("The code must define a top-level `async def setup(bot)` that adds the cog.")
+    check_orion_api(tree, slug)
+
+
+# --------------------------------------------------------------------------- does the code use the bot's real API?
+# The model only knows the API from the prompt and sometimes invents or misremembers it (`await bot.db.get(...)`,
+# `alerts.send_admin_alert(...)`). Those mistakes are syntactically fine, so they only blow up when a command is run.
+# These checks catch them before a human has to find out in Discord, and the message goes back to the model for its retry.
+ALLOWED_ORION_MODULES = ("alerts", "checks", "config")
+
+
+def _public(module) -> list[str]:
+    return sorted(n for n in dir(module) if not n.startswith("_"))
+
+
+def _module_str_constants(tree: ast.Module) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for n in tree.body:
+        if isinstance(n, ast.Assign) and isinstance(n.value, ast.Constant) and isinstance(n.value.value, str):
+            for target in n.targets:
+                if isinstance(target, ast.Name):
+                    out[target.id] = n.value.value
+    return out
+
+
+def _key_prefix(arg: ast.expr, consts: dict[str, str]) -> Optional[str]:
+    """The literal start of a config key argument, if it can be known without running the code."""
+    if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+        return arg.value
+    if isinstance(arg, ast.Name):
+        return consts.get(arg.id)
+    if isinstance(arg, ast.JoinedStr) and arg.values and isinstance(arg.values[0], ast.Constant):
+        return str(arg.values[0].value)
+    return None
+
+
+def check_orion_api(tree: ast.Module, slug: Optional[str] = None) -> None:
+    from . import alerts, checks, config as cfg
+    modules = {"alerts": alerts, "checks": checks, "config": cfg}
+    aliases: dict[str, str] = {}                      # local name -> "alerts" / "checks" / "config"
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            if node.module == "orion":
+                for a in node.names:
+                    if a.name not in ALLOWED_ORION_MODULES:
+                        raise DraftError(f"`from orion import {a.name}` is not allowed. You may import only "
+                                         f"{', '.join(ALLOWED_ORION_MODULES)} from orion.")
+                    aliases[a.asname or a.name] = a.name
+            elif node.module.split(".")[0] == "orion":
+                sub = node.module.split(".")[1] if "." in node.module else ""
+                if sub not in modules:
+                    raise DraftError(f"`import from {node.module}` is not allowed. You may import only "
+                                     f"{', '.join(ALLOWED_ORION_MODULES)} from orion.")
+                for a in node.names:
+                    if a.name != "*" and not hasattr(modules[sub], a.name):
+                        raise DraftError(f"`orion.{sub}` has no `{a.name}`. It has: {', '.join(_public(modules[sub]))}.")
+        elif isinstance(node, ast.Import):
+            for a in node.names:
+                if a.name.split(".")[0] == "orion":
+                    raise DraftError("Use `from orion import config, alerts` style imports, not `import orion`.")
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id in aliases
+                and not node.attr.startswith("_")):
+            mod = aliases[node.value.id]
+            if not hasattr(modules[mod], node.attr):
+                hint = (" To tell staff about a problem use `await alerts.alert_staff(bot, guild, text, key=...)`."
+                        if mod == "alerts" else "")
+                raise DraftError(f"`{node.value.id}.{node.attr}` does not exist in orion.{mod}. It has: "
+                                 f"{', '.join(_public(modules[mod]))}.{hint}")
+
+    consts = _module_str_constants(tree)
+    awaited = {id(n.value) for n in ast.walk(tree) if isinstance(n, ast.Await)}
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr in ("get", "set")
+                and isinstance(node.func.value, ast.Attribute) and node.func.value.attr == "db"):
+            continue
+        name, is_awaited = node.func.attr, id(node) in awaited
+        if name == "get" and is_awaited:
+            raise DraftError(f"Line {node.lineno}: `bot.db.get(...)` is a normal function, not async. Remove the `await` "
+                             "(only `bot.db.set` is awaited).")
+        if name == "set" and not is_awaited:
+            raise DraftError(f"Line {node.lineno}: `bot.db.set(...)` is async and must be awaited: `await bot.db.set(...)`. "
+                             "Without `await` nothing is saved.")
+        if slug and node.args:
+            key = _key_prefix(node.args[0], consts)
+            if key is not None and not key.startswith(f"gen_{slug}:"):
+                raise DraftError(f"Line {node.lineno}: config keys for bot.db.{name} must start with `gen_{slug}:` "
+                                 f"(found `{key[:40]}`).")
 
 
 _TABLE_RE = re.compile(r"^create\s+table\s+if\s+not\s+exists\s+([a-z0-9_]+)\s*\(", re.I | re.S)
@@ -135,7 +222,7 @@ def build_draft(text: str, *, forced_slug: Optional[str] = None, taken: Iterable
     if not forced_slug and slug in set(taken):
         raise DraftError(f"The feature name '{slug}' is already used by another feature. Choose a different SLUG.")
     code = strip_fences(sec["CODE"])
-    validate_code(code)
+    validate_code(code, slug)
     schema = sec.get("SCHEMA", "").strip()
     if schema.upper() in ("", "NONE", "N/A"):
         schema = ""
@@ -186,7 +273,10 @@ ENVIRONMENT
 - The file is loaded with bot.load_extension, so it MUST define a top-level `async def setup(bot)` that does \
 `await bot.add_cog(YourCog(bot))`.
 - `bot` is the running commands.Bot. `bot.db.pool` is an asyncpg pool. `bot.db.get(key, default)` and \
-`await bot.db.set(key, value)` are a small JSON key/value config store.
+`await bot.db.set(key, value)` are a small JSON key/value config store. NOTE: `bot.db.get` is a normal function \
+(never `await` it); `bot.db.set` is async (always `await` it).
+- To tell staff about a problem, use `await alerts.alert_staff(bot, guild, "text", key="gen_<slug>:something")`. It is the \
+only function in `alerts`; do not invent others.
 - You may import from orion: `from orion import config, alerts`, and `from orion.checks import is_admin, is_staff, \
 require_admin, require_staff`. Useful: config.GUILD_ID (the bot serves one server: bot.get_guild(config.GUILD_ID)), \
 config.COLOR_MAIN, config.COLOR_ACCENT, config.BRAND. Import no other orion module.

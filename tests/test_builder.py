@@ -636,7 +636,7 @@ def test_modify_builds_on_the_latest_non_rejected_version_and_replaces_a_waiting
         assert kw["slug"] == "omega" and kw["previous_code"] == cog_source("omega", 2) and "Celestial" in kw["feedback"]
         assert (await h.bot.db.bb_get(waiting))["status"] == "rejected"            # replaced by the new draft
         new = (await h.bot.db.bb_pending())[0]
-        assert new["version"] == 3 and "Celestial" in new["request"]
+        assert new["version"] == 3 and "Celestial" in new["change_note"] and new["request"] == "req"
         missing = fake_i(h.bot)
         await cog.modify.callback(cog, missing, "nothing_here", "change it")
         assert "no feature" in missing.response.send_message.call_args.args[0]
@@ -658,7 +658,7 @@ def test_request_changes_modal_creates_the_next_version_and_keeps_the_old_one_if
             builder.generate = orig
         assert (await h.bot.db.bb_get(b))["status"] == "rejected"
         new = (await h.bot.db.bb_pending())[0]
-        assert new["version"] == 2 and new["request"].startswith("Changes: use buttons")
+        assert new["version"] == 2 and new["change_note"] == "use buttons instead of a dropdown" and new["request"] == "req"
         assert i.followup.send.call_args.kwargs["view"]                              # fresh buttons on the new draft
 
         keep = await h.add("tau2", cog_source("tau2", 1))
@@ -769,3 +769,151 @@ def test_user_message_includes_server_block():
     m = builder.build_user_message("make rules thing", server="CHANNELS x")
     assert "REAL CHANNELS AND ROLES" in m and "CHANNELS x" in m
     assert "REAL CHANNELS" not in builder.build_user_message("x")
+
+
+# ------------------------------------------------------------------ the bot's API is checked before a human reads the code
+def _cog(extra: str) -> str:
+    return ("from discord.ext import commands\nfrom orion import config, alerts\nfrom orion.checks import require_admin\n"
+            + extra + "\nasync def setup(bot):\n    pass\n")
+
+
+@pytest.mark.parametrize("body, why", [
+    ("async def f(bot):\n    return await bot.db.get('gen_x:a', None)\n", "not async"),
+    ("async def f(bot):\n    bot.db.set('gen_x:a', 1)\n", "must be awaited"),
+    ("async def f(bot):\n    await alerts.send_admin_alert('x')\n", "does not exist in orion.alerts"),
+    ("X = config.NO_SUCH_THING\n", "does not exist in orion.config"),
+    ("async def f(bot):\n    await bot.db.set('gen:x:a', 1)\n", "must start with `gen_x:`"),
+    ("K = 'wrong:key'\nasync def f(bot):\n    return bot.db.get(K)\n", "must start with `gen_x:`"),
+    ("from orion import ai\n", "not allowed"),
+    ("from orion.db import Database\n", "not allowed"),
+    ("from orion.checks import require_nobody\n", "has no"),
+    ("import orion\n", "not `import orion`"),
+])
+def test_invented_or_misused_bot_api_is_caught_before_a_human_sees_it(body, why):
+    with pytest.raises(DraftError, match=why):
+        validate_code(_cog(body), "x")
+
+
+def test_correct_use_of_the_bot_api_passes():
+    validate_code(_cog("K = 'gen_x:chan'\n@app_commands_placeholder\nasync def f(bot, guild):\n    v = bot.db.get(K, None)\n"
+                       "    w = bot.db.get(f'gen_x:{guild.id}')\n    await bot.db.set(K, 1)\n"
+                       "    await alerts.alert_staff(bot, guild, 'hi', key='gen_x:a')\n    return config.COLOR_MAIN, require_admin\n"
+                       ).replace("@app_commands_placeholder\n", ""), "x")
+
+
+def test_the_rankpanel_mistakes_would_have_been_rejected():
+    """The three real mistakes in the first generated /rankpanel cog: awaiting db.get, a made-up alerts function, bad keys."""
+    cog = ("import discord\nfrom discord.ext import commands\nfrom orion import config, alerts\n"
+           "CONFIG_CHANNEL_ID = 'gen:rank_roles:channel_id'\n"
+           "class C(commands.Cog):\n    def __init__(self, bot):\n        self.bot = bot\n"
+           "    async def ensure(self, guild):\n        cid = await self.bot.db.get(CONFIG_CHANNEL_ID, None)\n"
+           "        await alerts.send_admin_alert('no category')\n"
+           "async def setup(bot):\n    await bot.add_cog(C(bot))\n")
+    with pytest.raises(DraftError):
+        build_draft(answer(slug="rank_roles", code=cog))
+    fixed = (cog.replace("await self.bot.db.get", "self.bot.db.get").replace("alerts.send_admin_alert('no category')",
+             "alerts.alert_staff(self.bot, guild, 'no category', key='gen_rank_roles:cat')")
+             .replace("gen:rank_roles:", "gen_rank_roles:"))
+    assert build_draft(answer(slug="rank_roles", code=fixed)).slug == "rank_roles"
+
+
+# ------------------------------------------------------------------ /build fixes found in review
+@needs_db
+def test_modify_after_a_rollback_builds_on_the_version_that_is_running(tmp):
+    async def t(h, cog):
+        log = []
+        b1 = await h.add("rb", cog_source("rb", 1)); assert (await h.rt.activate(b1, 1)).ok
+        b2 = await h.add("rb", cog_source("rb", 2)); assert (await h.rt.activate(b2, 1)).ok
+        assert (await h.rt.activate(b1, 1, run_schema=False)).ok            # rolled back: v2 is 'superseded', v1 runs
+        assert (await h.bot.db.bb_get(b2))["status"] == "superseded"
+        orig = (ai.is_configured, builder.generate)
+        ai.is_configured, builder.generate = (lambda: True), fake_generate("rb", 3, log=log)
+        try:
+            i = fake_i(h.bot)
+            await cog.modify.callback(cog, i, "rb", "tweak it")
+        finally:
+            ai.is_configured, builder.generate = orig
+        assert log[0]["previous_code"] == cog_source("rb", 1)               # NOT the rolled-back v2
+        assert (await h.bot.db.bb_pending())[0]["version"] == 3
+        assert "Here is v3" in sent(i) and "built on v1" in sent(i)
+    runner(tmp, with_cog_wrapper(t))
+
+
+@needs_db
+def test_the_original_request_survives_repeated_changes(tmp):
+    async def t(h, cog):
+        b1 = await h.add("orq", cog_source("orq", 1)); assert (await h.rt.activate(b1, 1)).ok
+        seen = []
+
+        async def gen(request, **kw):
+            seen.append((request, kw.get("feedback")))
+            return builder.Draft(slug=kw["slug"], title="T", summary="s", notes="", schema_sql="",
+                                 code=cog_source(kw["slug"], len(seen) + 1))
+        orig = (ai.is_configured, builder.generate)
+        ai.is_configured, builder.generate = (lambda: True), gen
+        try:
+            await cog.modify.callback(cog, fake_i(h.bot), "orq", "make it blue")
+            await cog.modify.callback(cog, fake_i(h.bot), "orq", "now red")
+        finally:
+            ai.is_configured, builder.generate = orig
+        assert [s[0] for s in seen] == ["req", "req"]                       # the AI always sees the original request
+        assert "make it blue" in seen[0][1] and "now red" in seen[1][1]
+        hist = fake_i(h.bot); await cog.history.callback(cog, hist, "orq")
+        assert "Changes: now red" in hist.response.send_message.call_args.args[0]
+        embed = bcog.review_embed(await h.bot.db.bb_get((await h.bot.db.bb_pending())[0]["id"]), pending=True)
+        assert {f.name for f in embed.fields} >= {"Changes asked for", "Original request"}
+    runner(tmp, with_cog_wrapper(t))
+
+
+@needs_db
+def test_a_rollback_that_hits_a_discord_error_does_not_strike_the_old_version_off(tmp):
+    async def t(h, cog):
+        b1 = await h.add("poison", cog_source("poison", 1)); assert (await h.rt.activate(b1, 1)).ok
+        b2 = await h.add("poison", cog_source("poison", 2)); assert (await h.rt.activate(b2, 1)).ok
+        h.fail_sync = True                                                  # Discord refuses the command sync
+        r = await h.rt.activate(b1, 1, run_schema=False)
+        assert not r.ok and h.version_running("poison") == 2                # v2 is still what runs
+        assert (await h.bot.db.bb_get(b1))["status"] == "superseded"        # v1 is still a valid rollback target
+        assert (await h.bot.db.bb_previous_working("poison", 2))["id"] == b1
+        h.fail_sync = False
+        assert (await h.rt.activate(b1, 1, run_schema=False)).ok and h.version_running("poison") == 1
+    runner(tmp, with_cog_wrapper(t))
+
+
+@needs_db
+def test_modify_and_history_autocomplete_include_features_that_never_loaded(tmp):
+    async def t(h, cog):
+        await h.add("never", cog_source("never", 1, boom=True))             # a draft: no builder_features row yet
+        ok = await h.add("shown", cog_source("shown", 1)); assert (await h.rt.activate(ok, 1)).ok
+        i = fake_i(h.bot)
+        assert {c.value for c in await cog._modify_ac(i, "")} == {"never", "shown"}
+        assert {c.value for c in await cog._history_ac(i, "nev")} == {"never"}
+        assert {c.value for c in await cog._rollback_ac(i, "")} == {"shown"}   # rollback/enable/disable need an approved one
+    runner(tmp, with_cog_wrapper(t))
+
+
+@needs_db
+def test_an_approve_that_changed_nothing_hands_the_buttons_back(tmp):
+    async def t(h, cog):
+        b = await h.add("kap", cog_source("kap", 1), "CREATE TABLE IF NOT EXISTS gen_kap_t (id INT);")
+
+        async def boom(_): raise OSError("disk full")
+        h.rt.take_snapshot = boom
+        click = fake_i(h.bot)
+        await bcog.ApproveButton(b).callback(click)
+        last = click.followup.send.call_args_list[-1]
+        assert "still waiting" in last.args[0] and "disk full" in last.args[0] and last.kwargs["view"]
+        assert (await h.bot.db.bb_get(b))["status"] == "pending"
+    runner(tmp, with_cog_wrapper(t))
+
+
+@needs_db
+def test_build_list_survives_more_than_25_features(tmp):
+    async def t(h, cog):
+        for n in range(26):
+            b = await h.add(f"lf{n:02d}", cog_source(f"lf{n:02d}", 1)); assert (await h.rt.activate(b, 1)).ok
+        i = fake_i(h.bot)
+        await cog.list_.callback(cog, i)
+        embed = i.response.send_message.call_args.kwargs["embed"]
+        assert len(embed.fields) <= 25 and "Showing 24 of 26" in embed.description
+    runner(tmp, with_cog_wrapper(t))

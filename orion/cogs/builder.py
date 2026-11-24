@@ -43,7 +43,11 @@ def review_embed(b, *, pending: bool) -> discord.Embed:
                     value=f"New: {tables}\nA data snapshot of the whole database is taken before they are created.")
     else:
         e.add_field(name="Database changes", value="None", inline=False)
-    e.add_field(name="Asked for", value=b["request"][:500], inline=False)
+    if b["change_note"]:
+        e.add_field(name="Changes asked for", value=b["change_note"][:700], inline=False)
+        e.add_field(name="Original request", value=b["request"][:300], inline=False)
+    else:
+        e.add_field(name="Asked for", value=b["request"][:500], inline=False)
     if b["error"]:
         e.add_field(name="Last error", value=f"`{b['error'][:500]}`", inline=False)
     e.set_footer(text="Read the attached file first. Approve loads it into the live bot straight away." if pending
@@ -78,9 +82,11 @@ async def create_build(bot, user_id: int, request: str, *, base=None, feedback: 
         previous_code=base["code"] if base else None, previous_schema=base["schema_sql"] if base else None,
         feedback=feedback, model=config.BUILDER_MODEL or None,
         server=builder.format_server(bot.get_guild(config.GUILD_ID)))
-    shown = (f"Changes: {feedback}" if feedback and base is not None and request == base["request"] else request)
-    bid, _ = await db.bb_add(draft.slug, draft.title, shown, draft.summary, draft.notes, draft.code, draft.schema_sql,
-                             config.BUILDER_MODEL or config.AI_MODEL, user_id)
+    # `request` stays the ORIGINAL request on every version (the AI is shown it again on each change); what was asked of
+    # this version in particular is stored separately.
+    note = feedback.strip() if feedback and base is not None else None
+    bid, _ = await db.bb_add(draft.slug, draft.title, request, draft.summary, draft.notes, draft.code, draft.schema_sql,
+                             config.BUILDER_MODEL or config.AI_MODEL, user_id, change_note=note)
     await db.record_audit(user_id, "build.draft", "builder_build", bid, slug=draft.slug)
     return await db.bb_get(bid)
 
@@ -126,6 +132,11 @@ class ApproveButton(_PatriarchOnly, discord.ui.DynamicItem[discord.ui.Button], t
         res = await rt.activate(self.bid, i.user.id)
         text = res.message
         if not res.ok:
+            again = await bot.db.bb_get(self.bid)
+            if again is not None and again["status"] == "pending":
+                # nothing was changed (for example the database backup failed): it is still waiting, so give the buttons back
+                return await i.followup.send(f"❌ **Not loaded.** {text}\nIt is still waiting for your decision:"[:1900],
+                                             ephemeral=True, **review_payload(again))
             text = f"❌ **Not loaded.** {text}\nUse `/build modify feature:{b['slug']}` to have the AI fix it."
         await i.followup.send(text[:1900], ephemeral=True)
 
@@ -213,8 +224,10 @@ class Build(commands.GroupCog, name="build", description="Have the AI build new 
             return False
         return True
 
-    async def _features(self, current: str):
-        rows = await self.db.bf_list()
+    async def _features(self, current: str, *, unapproved: bool = False):
+        """Features for autocomplete. `unapproved` also lists ones that have builds but were never approved (a first version
+        that failed to load or is still waiting), which /build modify and /build history can still work with."""
+        rows = await (self.db.bb_features() if unapproved else self.db.bf_list())
         cur = current.lower()
         return [app_commands.Choice(name=f"{r['title']} ({r['slug']})"[:100], value=r["slug"]) for r in rows
                 if cur in r["slug"] or cur in r["title"].lower()][:25]
@@ -234,8 +247,9 @@ class Build(commands.GroupCog, name="build", description="Have the AI build new 
             return await i.followup.send(plain_error(e), ephemeral=True)
         if base is not None and base["status"] == "pending":
             await self.db.bb_claim_pending(base["id"], "rejected")
-        await i.followup.send(intro or "Here is what the AI wrote. Nothing is loaded until you press **Approve**.",
-                              ephemeral=True, **review_payload(b))
+        text = (intro.replace("{version}", str(b["version"])) if intro
+                else "Here is what the AI wrote. Nothing is loaded until you press **Approve**.")
+        await i.followup.send(text, ephemeral=True, **review_payload(b))
 
     # ---- create / change
     @app_commands.command(name="new", description="Describe a feature; the AI writes it for you to review")
@@ -254,24 +268,31 @@ class Build(commands.GroupCog, name="build", description="Have the AI build new 
         base = next((b for b in builds if b["status"] != "rejected"), builds[0] if builds else None)
         if base is None:
             return await i.response.send_message("There is no feature with that name.", ephemeral=True)
+        if base["status"] == "superseded":
+            # The newest version is an old one that was rolled back from. Change what is really running instead.
+            f = await self.db.bf_get(feature)
+            running = await self.db.bb_get(f["active_build_id"]) if f and f["active_build_id"] else None
+            if running is not None:
+                base = running
         text = request.strip()
         if base["status"] == "failed" and base["error"]:
             text += f"\n\n(Note: the previous version failed to load with: {base['error'][:400]})"
         extra = " The draft that was waiting is replaced by this one." if base["status"] == "pending" else ""
         await self._generate(i, base["request"], base=base, feedback=text,
-                             intro=f"Here is v{base['version'] + 1} of **{base['title']}**.{extra} Nothing is loaded until you "
-                                   "press **Approve**.")
+                             intro=f"Here is v{{version}} of **{base['title']}**, built on v{base['version']}.{extra} Nothing is "
+                                   "loaded until you press **Approve**.")
 
     @modify.autocomplete("feature")
     async def _modify_ac(self, i: discord.Interaction, current: str):
-        return await self._features(current)
+        return await self._features(current, unapproved=True)
 
     # ---- look
     @app_commands.command(name="list", description="Features built so far, and drafts waiting for your decision")
     async def list_(self, i: discord.Interaction):
         feats, pending = await self.db.bf_list(), await self.db.bb_pending()
         e = discord.Embed(title="🛠️ Built features", color=config.COLOR_MAIN)
-        for f in feats:
+        shown_feats = feats[:24]                                   # an embed holds 25 fields; one is kept for the waiting drafts
+        for f in shown_feats:
             b = await self.db.bb_get(f["active_build_id"]) if f["active_build_id"] else None
             state = "✅ on" if f["enabled"] and runtime(self.bot) and runtime(self.bot).loaded(f["slug"]) else (
                 "⚠️ should be on but isn't loaded" if f["enabled"] else "⏸️ off")
@@ -279,6 +300,8 @@ class Build(commands.GroupCog, name="build", description="Have the AI build new 
                         value=f"{state} · running v{b['version'] if b else '—'}")
         if not feats:
             e.description = "Nothing has been approved yet. Start with `/build new`."
+        elif len(feats) > len(shown_feats):
+            e.description = f"Showing {len(shown_feats)} of {len(feats)} features."
         if pending:
             e.add_field(name="Waiting for your decision", inline=False,
                         value="\n".join(f"🕓 #{p['id']} {p['title']} v{p['version']}: `/build show build:{p['id']}`"
@@ -291,13 +314,15 @@ class Build(commands.GroupCog, name="build", description="Have the AI build new 
         rows = await self.db.bb_list(feature, 15)
         if not rows:
             return await i.response.send_message("There is no feature with that name.", ephemeral=True)
+        def asked(r) -> str:
+            return ("Changes: " + r["change_note"]) if r["change_note"] else r["request"]
         lines = [f"{STATUS_ICON.get(r['status'], '•')} **v{r['version']}** (build #{r['id']}) <t:{int(r['created_at'].timestamp())}:R>"
-                 f" · {r['status']}\n> {r['request'][:90].replace(chr(10), ' ')}" for r in rows]
+                 f" · {r['status']}\n> {asked(r)[:90].replace(chr(10), ' ')}" for r in rows]
         await i.response.send_message("\n".join(lines)[:1950], ephemeral=True)
 
     @history.autocomplete("feature")
     async def _history_ac(self, i: discord.Interaction, current: str):
-        return await self._features(current)
+        return await self._features(current, unapproved=True)
 
     @app_commands.command(name="show", description="Open a build's code (with the buttons if it's still waiting)")
     @app_commands.describe(build="The build number")

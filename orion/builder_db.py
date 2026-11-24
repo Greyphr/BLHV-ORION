@@ -31,13 +31,16 @@ class BuilderStore:
 
     # ---- builds
     async def bb_add(self, slug: str, title: str, request: str, summary: str, notes: str, code: str,
-                     schema_sql: str, model: str, created_by: Optional[int]) -> tuple[int, int]:
-        """Store a new pending version. Returns (build_id, version)."""
+                     schema_sql: str, model: str, created_by: Optional[int],
+                     change_note: Optional[str] = None) -> tuple[int, int]:
+        """Store a new pending version. Returns (build_id, version). `request` is always the ORIGINAL feature request (it is
+        what the AI is shown on every later change); what was asked of this particular version goes in `change_note`."""
         row = await self.pool.fetchrow(
-            "INSERT INTO builder_builds(slug, version, title, request, summary, notes, code, schema_sql, model, created_by) "
-            "SELECT $1, COALESCE(MAX(version), 0) + 1, $2, $3, $4, $5, $6, $7, $8, $9 FROM builder_builds WHERE slug=$1 "
+            "INSERT INTO builder_builds(slug, version, title, request, summary, notes, code, schema_sql, model, created_by, "
+            "change_note) "
+            "SELECT $1, COALESCE(MAX(version), 0) + 1, $2, $3, $4, $5, $6, $7, $8, $9, $10 FROM builder_builds WHERE slug=$1 "
             "RETURNING id, version",
-            slug, title, request, summary, notes, code, schema_sql or None, model, created_by)
+            slug, title, request, summary, notes, code, schema_sql or None, model, created_by, change_note or None)
         return row["id"], row["version"]
 
     async def bb_get(self, build_id: int):
@@ -52,6 +55,11 @@ class BuilderStore:
 
     async def bb_pending(self):
         return await self.pool.fetch("SELECT * FROM builder_builds WHERE status='pending' ORDER BY id")
+
+    async def bb_features(self):
+        """Every feature name that has any build at all (newest title each), including ones never approved."""
+        return await self.pool.fetch(
+            "SELECT DISTINCT ON (slug) slug, title FROM builder_builds ORDER BY slug, version DESC")
 
     async def bb_slugs(self) -> set[str]:
         """Every slug ever used (even by a rejected draft): a new feature must not reuse one."""

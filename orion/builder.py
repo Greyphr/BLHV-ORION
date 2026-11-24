@@ -148,6 +148,35 @@ def build_draft(text: str, *, forced_slug: Optional[str] = None, taken: Iterable
                  notes="" if notes.upper() in ("NONE", "N/A") else notes[:1500], schema_sql=schema, code=code)
 
 
+# --------------------------------------------------------------------------- what the AI is told about the server
+MAX_SERVER_CHARS = 12000
+
+
+def format_server(guild) -> str:
+    """The server's structure as plain text for the prompt: categories, channels and roles with their IDs, so a loosely typed
+    name ("the rules channel", "gold role") can be matched to the real one. Names and IDs only: no messages, no members."""
+    if guild is None:
+        return ""
+    lines = ["CHANNELS (grouped by category; id in brackets)"]
+    for cat in sorted(getattr(guild, "categories", []), key=lambda c: c.position):
+        lines.append(f"CATEGORY {cat.name} [{cat.id}]")
+        for ch in sorted(cat.channels, key=lambda c: c.position):
+            lines.append(f"  {ch.name} ({ch.type}) [{ch.id}]")
+    loose = [c for c in guild.channels if getattr(c, "category", None) is None and str(c.type) != "category"]
+    if loose:
+        lines.append("NO CATEGORY")
+        lines += [f"  {c.name} ({c.type}) [{c.id}]" for c in sorted(loose, key=lambda c: c.position)]
+    lines.append("ROLES (highest first; id in brackets)")
+    for r in sorted(guild.roles, key=lambda r: -r.position):
+        if r.is_default():
+            continue
+        lines.append(f"  {r.name} [{r.id}]" + (" (bot/integration role)" if r.managed else ""))
+    text = "\n".join(lines)
+    if len(text) > MAX_SERVER_CHARS:
+        text = text[:MAX_SERVER_CHARS].rsplit("\n", 1)[0] + "\n  ...(list cut short: very large server)"
+    return text
+
+
 # --------------------------------------------------------------------------- the prompt
 SYSTEM_PROMPT = """You write ONE self-contained discord.py 2.x extension file (a "cog") for Orion, the Discord bot of the Blue \
 Heaven Sect server. A human reviews your code before it is loaded, so write clear, conservative, readable code.
@@ -185,6 +214,13 @@ the whole point of the feature.
 9. Never invent facts. If the request depends on facts you are not certain of (a game's rank names, IDs, wording), put them \
 in clearly named constants at the top of the file and list them in NOTES for the reviewer to check.
 10. Do what was asked and nothing more. Keep it small.
+11. The request is written casually, so channel and role names may be partial, lower-case, or missing their emoji/decoration \
+("the rules channel", "gold role"). You are given the server's real channels and roles. Match each name the request uses to the \
+real one in that list. In the code, refer to what you matched by its ID in a named constant at the top of the file with the real \
+name in a comment, and at runtime check that it still exists (guild.get_channel(id), guild.get_role(id)) and tell the admin in \
+plain words if not. If two things could match, or nothing does, do not guess: pick the most likely, and say so in NOTES. For \
+roles or channels the request says to CREATE, use the names the request gives; look for an existing one first (rule 6). In NOTES, \
+add one line per match in this form: Matched: "rules" -> #rules-and-info (id 123).
 
 OUTPUT FORMAT. Reply with exactly these sections. Each header is on its own line. Nothing before the first header and nothing \
 after the code. No markdown code fences.
@@ -208,8 +244,11 @@ same SLUG."""
 def build_user_message(request: str, *, existing_commands: Iterable[str] = (), taken_slugs: Iterable[str] = (),
                        slug: Optional[str] = None, previous_code: Optional[str] = None,
                        previous_schema: Optional[str] = None, feedback: Optional[str] = None,
-                       error: Optional[str] = None, previous_answer: Optional[str] = None) -> str:
+                       error: Optional[str] = None, previous_answer: Optional[str] = None,
+                       server: Optional[str] = None) -> str:
     parts = [f"FEATURE REQUEST:\n{request.strip()}"]
+    if server:
+        parts.append("THE SERVER'S REAL CHANNELS AND ROLES (match names in the request to these):\n" + server)
     cmds = sorted(set(existing_commands))
     parts.append("EXISTING SLASH COMMAND NAMES (do not reuse): " + (", ".join(cmds) if cmds else "none"))
     if slug:
@@ -237,7 +276,8 @@ Completer = Callable[..., Awaitable[str]]
 async def generate(request: str, *, existing_commands: Iterable[str] = (), taken_slugs: Iterable[str] = (),
                    slug: Optional[str] = None, previous_code: Optional[str] = None,
                    previous_schema: Optional[str] = None, feedback: Optional[str] = None,
-                   model: Optional[str] = None, complete: Completer = ai.complete) -> Draft:
+                   model: Optional[str] = None, complete: Completer = ai.complete,
+                   server: Optional[str] = None) -> Draft:
     """Ask the model for a feature. If its answer fails the automatic checks (syntax, format, SQL rules) it gets ONE chance to
     fix it, with the error shown. Raises ai.AIError (service problem) or DraftError (still unusable after the retry)."""
     if not request.strip():
@@ -248,7 +288,7 @@ async def generate(request: str, *, existing_commands: Iterable[str] = (), taken
     for attempt in (1, 2):
         user = build_user_message(request, existing_commands=existing, taken_slugs=taken, slug=slug,
                                   previous_code=previous_code, previous_schema=previous_schema, feedback=feedback,
-                                  error=error, previous_answer=answer)
+                                  error=error, previous_answer=answer, server=server)
         answer = await complete(SYSTEM_PROMPT, user, max_tokens=config.BUILDER_MAX_TOKENS, model=model or None,
                                 raw=True, timeout=config.BUILDER_TIMEOUT_SECONDS)
         try:

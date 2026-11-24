@@ -722,3 +722,50 @@ def test_buttons_round_trip_their_custom_ids():
         m = cls.__discord_ui_compiled_template__.fullmatch(f"build:{kind}:42")
         assert m and m["id"] == "42"
         assert cls(42).item.custom_id == f"build:{kind}:42"
+
+
+# --------------------------------------------------------------------------- server snapshot
+class _Obj:
+    def __init__(self, **kw):
+        self.__dict__.update(kw)
+
+
+def _fake_guild(n_extra=0):
+    cat = _Obj(id=10, name="INFO", position=0, type="category", channels=[])
+    rules = _Obj(id=11, name="rules-and-info", position=0, type="text", category=cat)
+    news = _Obj(id=12, name="news", position=1, type="text", category=cat)
+    cat.channels = [news, rules]
+    loose = _Obj(id=13, name="general", position=0, type="text", category=None)
+    extra = [_Obj(id=100 + i, name=f"c{i}", position=i, type="text", category=None) for i in range(n_extra)]
+    roles = [
+        _Obj(id=1, name="@everyone", position=0, managed=False, is_default=lambda: True),
+        _Obj(id=2, name="Gold", position=1, managed=False, is_default=lambda: False),
+        _Obj(id=3, name="Orion", position=5, managed=True, is_default=lambda: False),
+    ]
+    return _Obj(categories=[cat], channels=[cat, rules, news, loose, *extra], roles=roles)
+
+
+def test_format_server_none_is_empty():
+    assert builder.format_server(None) == ""
+
+
+def test_format_server_content_and_order():
+    t = builder.format_server(_fake_guild())
+    assert "CATEGORY INFO [10]" in t
+    assert t.index("rules-and-info") < t.index("news")
+    assert "NO CATEGORY" in t and "general" in t
+    assert "@everyone" not in t
+    assert t.index("Orion") < t.index("Gold")
+    assert "bot/integration" in t
+
+
+def test_format_server_truncates():
+    t = builder.format_server(_fake_guild(n_extra=2000))
+    assert len(t) <= builder.MAX_SERVER_CHARS + 100
+    assert "cut short" in t
+
+
+def test_user_message_includes_server_block():
+    m = builder.build_user_message("make rules thing", server="CHANNELS x")
+    assert "REAL CHANNELS AND ROLES" in m and "CHANNELS x" in m
+    assert "REAL CHANNELS" not in builder.build_user_message("x")

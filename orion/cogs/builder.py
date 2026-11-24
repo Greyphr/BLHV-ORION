@@ -76,7 +76,8 @@ async def create_build(bot, user_id: int, request: str, *, base=None, feedback: 
         request, existing_commands=existing_command_names(bot, module_name(base["slug"]) if base else None),
         taken_slugs=() if base else await db.bb_slugs(), slug=base["slug"] if base else None,
         previous_code=base["code"] if base else None, previous_schema=base["schema_sql"] if base else None,
-        feedback=feedback, model=config.BUILDER_MODEL or None)
+        feedback=feedback, model=config.BUILDER_MODEL or None,
+        server=builder.format_server(bot.get_guild(config.GUILD_ID)))
     shown = (f"Changes: {feedback}" if feedback and base is not None and request == base["request"] else request)
     bid, _ = await db.bb_add(draft.slug, draft.title, shown, draft.summary, draft.notes, draft.code, draft.schema_sql,
                              config.BUILDER_MODEL or config.AI_MODEL, user_id)

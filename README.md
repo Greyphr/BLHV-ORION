@@ -652,6 +652,9 @@ it, and the bot loads it live, with no rebuild. If anything breaks, the previous
 
 Generated code lives in the database; `data/generated/` is a copy rewritten at every start, so you don't need to back it up.
 
+
+**It knows your server.** Every `/build` request is sent with a list of the server's real channels (grouped by category) and roles, with their IDs. So you can write "the rules channel" or "gold role" and it matches the real one. Only names and IDs are sent, never messages or members. The review's "Check these" notes list each match (`Matched: "rules" -> #rules-and-info`), so check those before approving. Very large servers get a truncated list.
+
 ## AI providers and the switcher
 
 Every AI feature (ticket helper, the `/ai test`, the dashboard test, `/build`) goes through one provider list. If the provider being

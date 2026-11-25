@@ -9,7 +9,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from .. import ai, config
+from .. import ai, ai_brief, config
 from ..checks import is_admin, is_staff, require_staff, staff_role_ids
 from ..db import RULE_DEFAULTS
 from ..levels import MAX_LEVEL, total_xp_for_level
@@ -535,7 +535,7 @@ class Dashboard(discord.ui.View):
         if not ai.is_configured():
             return await i.followup.send("❌ No `AI_API_KEY` in `.env`.", ephemeral=True)
         try:
-            text = await ai.complete("You are Orion, a friendly assistant of the Blue Heaven Sect Discord. Reply in one short sentence.",
+            text = await ai.complete(f"You are {ai_brief.ASSISTANT_NAME}, {ai_brief.ASSISTANT_TITLE}. Reply in one short sentence.",
                                      "Say hello and confirm you are connected.", model=self.db.get("ai_model", "") or None)
         except ai.AIError as e:
             return await i.followup.send(f"❌ The AI service failed: {e}", ephemeral=True)

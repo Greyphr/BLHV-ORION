@@ -1,5 +1,6 @@
-"""/ai: manage Orion's AI ticket handler (Sect Admin only): switch, settings, knowledge base, logs, test."""
+"""/ai: manage Orion's AI ticket handler (Sect Admin only): switch, settings, knowledge base, core brief, gaps, logs, test."""
 import asyncio
+import io
 import logging
 import time
 
@@ -7,16 +8,18 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from .. import ai, config
+from .. import ai, ai_brief, config
 from ..checks import require_admin
 from ..ticket_ai import AI_HELPER_KEY, LENGTHS, TONES, build_system_prompt, load_settings, parse_model_json, \
     parse_setting, select_knowledge
+from ..ticket_ai_runner import gather_facts
 
 log = logging.getLogger("orion.ai.admin")
 
 SETTING_CHOICES = ["tone", "length", "personality", "confidence", "auto-close", "max-replies", "ping-staff",
                    "model", "human-only-types"]
-KIND_ICON = {"reply": "💬", "escalate": "🙋", "close": "✅", "error": "⚠️", "skip": "⏭️", "handoff": "🤝"}
+KIND_ICON = {"reply": "💬", "escalate": "🙋", "close": "✅", "error": "⚠️", "skip": "⏭️", "handoff": "🤝", "gap": "❓"}
+MAX_IMPORT_BYTES = 300_000
 
 
 def _ago(seconds: float) -> str:
@@ -46,8 +49,26 @@ class KnowledgeModal(discord.ui.Modal):
         await i.response.send_message(f"✅ Knowledge entry **#{eid}** saved.", ephemeral=True)
 
 
+class BriefModal(discord.ui.Modal):
+    def __init__(self, cog: "AIAdmin", current: str):
+        super().__init__(title="Core brief: who Blue Heaven is")
+        self.cog = cog
+        self.c = discord.ui.TextInput(label="What the AI always knows about Blue Heaven", style=discord.TextStyle.paragraph,
+                                      max_length=ai_brief.BRIEF_MAX, default=current[:ai_brief.BRIEF_MAX] or None,
+                                      placeholder="What the Sect is, what it stands for, its games and teams, how to join, who to ask...")
+        self.add_item(self.c)
+
+    async def on_submit(self, i: discord.Interaction):
+        text = self.c.value.strip()
+        await self.cog.db.set(ai_brief.BRIEF_KEY, text)
+        await self.cog.db.record_audit(i.user.id, "ai.brief.set", "config", ai_brief.BRIEF_KEY, chars=len(text))
+        await i.response.send_message(f"✅ Core brief saved ({len(text):,} characters)." if text else "🗑️ Core brief cleared.",
+                                      ephemeral=True)
+
+
 class AIAdmin(commands.GroupCog, name="ai", description="Orion's AI ticket handler (Sect Admin)"):
     kb = app_commands.Group(name="kb", description="The approved knowledge base the AI may answer from")
+    brief = app_commands.Group(name="brief", description="The overview of Blue Heaven the AI always has in front of it")
     provider = app_commands.Group(name="provider", description="Which AI service answers, and the backups if it is down")
 
     def __init__(self, bot):
@@ -95,6 +116,9 @@ class AIAdmin(commands.GroupCog, name="ai", description="Orion's AI ticket handl
         e.add_field(name="Max AI replies per ticket", value=str(s.max_replies), inline=True)
         e.add_field(name="Ping staff on handover", value="yes" if s.ping_staff else "no", inline=True)
         e.add_field(name="Knowledge entries", value=str(kb_n), inline=True)
+        brief_n = len(str(self.db.get(ai_brief.BRIEF_KEY, "") or ""))
+        e.add_field(name="Core brief", value=f"{brief_n:,} characters" if brief_n else "⚠️ not written (`/ai brief set`)",
+                    inline=True)
         e.add_field(name="Human-only ticket types (AI never answers)", value=", ".join(sorted(s.human_only)) or "none",
                     inline=False)
         if s.personality:
@@ -234,6 +258,73 @@ class AIAdmin(commands.GroupCog, name="ai", description="Orion's AI ticket handl
             await self.db.record_audit(i.user.id, "ai.kb.remove", "ai_knowledge", id)
         await i.response.send_message("🗑️ Removed." if ok else "No entry with that number.", ephemeral=True)
 
+    @kb.command(name="import", description="Load the core brief and knowledge entries from a .md or .txt file")
+    @app_commands.describe(file="A file of `## Title` sections. A section called CORE BRIEF becomes the core brief")
+    async def kb_import(self, i: discord.Interaction, file: discord.Attachment):
+        if not file.filename.lower().endswith((".md", ".txt", ".markdown")):
+            return await i.response.send_message("⚠️ Attach a `.md` or `.txt` file.", ephemeral=True)
+        if file.size > MAX_IMPORT_BYTES:
+            return await i.response.send_message(f"⚠️ That file is too big (the limit is {MAX_IMPORT_BYTES // 1000} KB).",
+                                                 ephemeral=True)
+        await i.response.defer(ephemeral=True, thinking=True)
+        parsed = ai_brief.parse_knowledge_file((await file.read()).decode("utf-8-sig", errors="replace"))
+        if parsed.brief is None and not parsed.entries:
+            return await i.followup.send("⚠️ Nothing to import: no filled-in sections were found. Each entry starts with a line "
+                                         "like `## Title`.\n" + "\n".join(f"• {x}" for x in parsed.skipped[:15]), ephemeral=True)
+        existing = {r["title"].strip().lower(): r for r in await self.db.kb_list()}
+        added = updated = 0
+        for title, content in parsed.entries:                 # same title = update, so re-importing an edited file is safe
+            row = existing.get(title.strip().lower())
+            if row is None:
+                existing[title.strip().lower()] = {"id": await self.db.kb_add(title, content, i.user.id), "title": title}
+                added += 1
+            else:
+                await self.db.kb_update(row["id"], title, content)
+                updated += 1
+        if parsed.brief is not None:
+            await self.db.set(ai_brief.BRIEF_KEY, parsed.brief)
+        await self.db.record_audit(i.user.id, "ai.kb.import", "ai_knowledge", None, file=file.filename, added=added,
+                                   updated=updated, brief=parsed.brief is not None, skipped=len(parsed.skipped))
+        lines = [f"✅ Imported **{file.filename}**: {added} added, {updated} updated"
+                 + (", core brief saved." if parsed.brief is not None else ".")]
+        if parsed.skipped:
+            lines.append(f"⏭️ Skipped {len(parsed.skipped)} (fix these and import again):")
+            lines += [f"• {x}" for x in parsed.skipped[:12]]
+        await i.followup.send("\n".join(lines)[:1900], ephemeral=True)
+
+    @kb.command(name="export", description="Download the core brief and all knowledge entries as one editable file")
+    async def kb_export(self, i: discord.Interaction):
+        rows = await self.db.kb_list()
+        text = ai_brief.render_knowledge_file(str(self.db.get(ai_brief.BRIEF_KEY, "") or ""),
+                                              [(r["title"], r["content"]) for r in rows])
+        await i.response.send_message(f"📄 {len(rows)} entries. Edit the file, then load it back with `/ai kb import`.",
+                                      file=discord.File(io.BytesIO(text.encode("utf-8")), filename="blue-heaven-knowledge.md"),
+                                      ephemeral=True)
+
+    # ------------------------------------------------------------ core brief
+    @brief.command(name="set", description="Write or replace the overview of Blue Heaven the AI always knows")
+    async def brief_set(self, i: discord.Interaction):
+        await i.response.send_modal(BriefModal(self, str(self.db.get(ai_brief.BRIEF_KEY, "") or "")))
+
+    @brief.command(name="show", description="Show the current core brief")
+    async def brief_show(self, i: discord.Interaction):
+        text = str(self.db.get(ai_brief.BRIEF_KEY, "") or "")
+        await i.response.send_message(text[:1900] if text else "No core brief yet. Write one with `/ai brief set`, or load a "
+                                      "file with `/ai kb import`.", ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+
+    # ------------------------------------------------------------ what Orion could not answer
+    @app_commands.command(name="gaps", description="Questions the AI couldn't answer: what to add to its knowledge next")
+    async def gaps(self, i: discord.Interaction):
+        rows = await self.db.ai_gap_logs(15)
+        if not rows:
+            return await i.response.send_message("No gaps recorded: every question so far was covered by what Orion knows.",
+                                                 ephemeral=True)
+        lines = [f"❓ <t:{int(r['created_at'].timestamp())}:R> ticket #{r['ticket_id'] or '—'}"
+                 f"{chr(10) + '> ' + r['summary'][:200] if r['summary'] else ''}" for r in rows]
+        await i.response.send_message("**Not covered by Orion's knowledge, newest first.** Add the answers with `/ai kb add`, "
+                                      "or `/ai kb export`, edit and `/ai kb import`.\n" + "\n".join(lines)[:1750],
+                                      ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+
     # -------------------------------------------------------------- logs / test
     @app_commands.command(name="logs", description="Recent AI activity (optionally for one ticket)")
     async def logs(self, i: discord.Interaction, ticket: app_commands.Range[int, 1, 10_000_000] | None = None):
@@ -257,8 +348,10 @@ class AIAdmin(commands.GroupCog, name="ai", description="Orion's AI ticket handl
         await i.response.defer(ephemeral=True, thinking=True)
         s = load_settings(self.db.get)
         kb = select_knowledge(await self.db.kb_list(True), question)
+        types = [dict(t) for t in await self.db.tt_list()]
         system = build_system_prompt(s, type_name="General Support", type_names=["General Support", "Other"], kb=kb,
-                                     guild_name=i.guild.name if i.guild else "Blue Heaven")
+                                     guild_name=i.guild.name if i.guild else "Blue Heaven",
+                                     brief=str(self.db.get(ai_brief.BRIEF_KEY, "") or ""), facts=gather_facts(self.db, types))
         from ..ticket_ai import build_user_message
         try:
             text = await ai.complete(system, build_user_message([{"q": "Question", "a": question}], []), max_tokens=700,

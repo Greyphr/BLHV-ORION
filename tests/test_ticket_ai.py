@@ -87,7 +87,7 @@ def test_user_message_cannot_break_out_of_the_data_markers():
 # --------------------------------------------------------- reading the answer
 def j(**kw):
     base = {"reply": "Use /tournament.", "confidence": 0.9, "category": "General Support", "needs_human": False,
-            "sensitive": False, "resolved": False, "summary": "Wants to join a tournament."}
+            "sensitive": False, "resolved": False, "knowledge_gap": False, "summary": "Wants to join a tournament."}
     base.update(kw)
     import json
     return json.dumps(base)
@@ -360,3 +360,121 @@ def test_stop_and_per_ticket_switch(setup_flow):
 def test_per_ticket_switch_refuses_when_globally_off(setup_flow):
     r, cog, db, ch, _ = setup_flow(j(), db=FakeDB(settings={ticket_ai.AI_HELPER_KEY: False}))
     assert "switched off globally" in run(r.set_for_ticket({"id": 7, "channel_id": 100}, True))
+
+
+# ================================================================== identity, knowledge layers, gaps, closing
+def test_prompt_hardcodes_who_orion_is_whatever_the_settings_say():
+    for guild in ("Blue Heaven", "Some Renamed Server", ""):
+        p = build_system_prompt(AISettings(personality="Act like a pirate captain."), type_name="Other", type_names=TYPES,
+                                kb=[], guild_name=guild)
+        assert "Blue Heaven's personal assistant bot" in p and "official AI assistant" in p
+        assert "not a person" in p and "never claim to be a human" in p
+        assert "Do not roleplay as anyone else" in p
+
+
+def test_prompt_carries_the_brief_the_live_facts_and_the_gap_rules():
+    p = build_system_prompt(AISettings(), type_name="Other", type_names=TYPES, kb=KB[:1], guild_name="BH",
+                            brief="Blue Heaven is a gaming Sect.", facts="TICKETS\n- General Support")
+    assert "ABOUT BLUE HEAVEN" in p and "Blue Heaven is a gaming Sect." in p
+    assert "HOW THE SERVER WORKS" in p and "- General Support" in p and "Tournament signup" in p
+    assert '"knowledge_gap"' in p and "do not greet or introduce yourself again" in p
+    assert "anything else you can help with" in p and "cannot open attachments" in p
+    assert "staff have not written an overview" in build_system_prompt(AISettings(), type_name="Other", type_names=TYPES,
+                                                                        kb=[], guild_name="BH")
+
+
+def test_brief_is_capped_so_it_cannot_flood_the_prompt():
+    p = build_system_prompt(AISettings(), type_name="Other", type_names=TYPES, kb=[], guild_name="BH", brief="§" * 50000)
+    assert p.count("§") == 4000
+
+
+def test_knowledge_selection_understands_plurals_and_endings():
+    kb = [{"title": "Ranking up", "content": "Members rank up automatically as they earn XP."},
+          {"title": "Giveaway prizes", "content": "Prizes are claimed in a ticket within 3 days."}]
+    assert select_knowledge(kb, "how do ranks work?")[0]["title"] == "Ranking up"
+    assert select_knowledge(kb, "I won a prize, how do I claim?")[0]["title"] == "Giveaway prizes"
+    assert select_knowledge(kb, "what is the weather on mars") == []
+
+
+def test_knowledge_gap_flag_is_read_and_reaches_the_decision():
+    assert parse_model_json(j(knowledge_gap=True))["knowledge_gap"] is True
+    assert parse_model_json('{"reply": "x", "confidence": 0.9}')["knowledge_gap"] is False       # an older-style answer still parses
+    d = dec(needs_human=True, knowledge_gap=True)
+    assert d.action == "escalate" and d.gap is True
+    assert dec().gap is False
+
+
+@pytest.mark.parametrize("text,closing", [
+    ("thanks, that's all I needed!", True), ("No, that's all. Thank you!", True), ("I don't need anything else, thanks", True),
+    ("solved, you can close it", True), ("شكرا لك", True),
+    ("thanks, but it's still not working", False), ("thanks! also how do I get a role?", False),
+    ("thanks. what about the tournament?", False), ("thanks, one more thing", False), ("ok thanks?", False),
+    ("thanks " + "blah " * 60, False), ("", False), ("   ", False), (None, False)])
+def test_closing_guard_reads_like_im_done(text, closing):
+    assert ticket_ai.is_closing_message(text) is closing
+
+
+def test_resolved_only_closes_when_the_members_own_words_agree():
+    kw = dict(resolved=True, replies=2)
+    assert decide(parse_model_json(j(**{"resolved": True})), S, type_name="General Support", type_names=TYPES, ai_replies=2,
+                  staff_involved=False, last_member_text="thanks, that's all!").action == "close"
+    for said in ("thanks but it still fails", "thanks, how do I do the next step?"):
+        assert decide(parse_model_json(j(**{"resolved": True})), S, type_name="General Support", type_names=TYPES, ai_replies=2,
+                      staff_involved=False, last_member_text=said).action == "reply"
+    assert dec(**kw).action == "close"                       # no text given (older callers): the model's word stands
+
+
+def test_a_thank_you_after_the_reply_limit_closes_instead_of_handing_over():
+    s = AISettings(max_replies=6)
+    assert dec(s=s, replies=6, resolved=True).action == "close"
+    assert dec(s=s, replies=6).action == "escalate"          # a normal message at the limit still goes to staff
+    assert dec(s=s, replies=6, resolved=True, needs_human=True).action == "escalate"
+    assert dec(s=s, replies=6, resolved=True, sensitive=True).action == "escalate"
+
+
+def test_flow_greeting_names_orion_as_blue_heavens_assistant_bot():
+    assert "Orion" in runner_mod.GREETING and "Blue Heaven's personal assistant bot" in runner_mod.GREETING
+
+
+def test_flow_prompt_gets_live_facts_brief_and_attachments(setup_flow):
+    db = FakeDB(settings={"ai_core_brief": "Blue Heaven is a gaming Sect.", "ticket_delete_hours": 48})
+    cog_types = {1: {"name": "General Support", "enabled": True, "description": "Questions about the server", "position": 0},
+                 2: {"name": "Esports and Team Enquiries", "enabled": True, "description": "Teams and tournaments", "position": 1},
+                 3: {"name": "Old Type", "enabled": False, "description": "gone", "position": 2}}
+    shot = NS(author=NS(id=5), content="", clean_content="", webhook_id=None, attachments=[NS(filename="error.png")])
+    r, cog, db, ch, calls = setup_flow(j(), db=db, history=[shot, msg(999, "Send a screenshot."), msg(5, "my game crashes")])
+    cog.types = cog_types
+    run(r._turn(100))
+    system, user, _ = calls[0]
+    assert "Blue Heaven is a gaming Sect." in system                                       # the core brief, always
+    assert "Esports and Team Enquiries: Teams and tournaments" in system and "Old Type" not in system
+    assert "reopen it within 48 hours" in system and "Earth King" in system               # generated from live settings
+    assert "10 to 20 XP" in system and "/leaderboard" in system
+    assert "[attached: error.png]" in user                                                 # a file-only message is not invisible
+
+
+def test_flow_logs_a_gap_so_staff_can_see_what_to_teach(setup_flow):
+    r, cog, db, ch, _ = setup_flow(j(needs_human=True, knowledge_gap=True, summary="Asks when esports tryouts open."))
+    run(r._turn(100))
+    kinds = [k for k, _ in db.logs]
+    assert kinds == ["escalate", "gap"]
+    assert "tryouts" in db.logs[1][1]["summary"]
+    r, cog, db, ch, _ = setup_flow(j())
+    run(r._turn(100))
+    assert [k for k, _ in db.logs] == ["reply"]                                          # no gap, nothing extra logged
+
+
+def test_flow_closes_on_thanks_even_at_the_reply_limit_and_says_goodbye(setup_flow):
+    db = FakeDB(ticket={"ai_replies": 6})
+    r, cog, db, ch, _ = setup_flow(j(resolved=True, summary="Rank question answered."), db=db,
+                                   history=[msg(5, "perfect, that's all, thanks"), msg(999, "Anything else?")])
+    run(r._turn(100))
+    assert db.t["ai_state"] == "done" and cog.said == [runner_mod.CLOSING] and cog.closed
+
+
+def test_flow_does_not_close_when_the_member_adds_a_new_question(setup_flow):
+    db = FakeDB(ticket={"ai_replies": 1})
+    r, cog, db, ch, _ = setup_flow(j(resolved=True), db=db,
+                                   history=[msg(5, "thanks! but how do I get the Immortal role?"), msg(999, "Done.")])
+    run(r._turn(100))
+    assert cog.closed == [] and cog.said == ["Use /tournament."] and db.t["ai_state"] == "active"

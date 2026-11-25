@@ -917,3 +917,10 @@ def test_build_list_survives_more_than_25_features(tmp):
         embed = i.response.send_message.call_args.kwargs["embed"]
         assert len(embed.fields) <= 25 and "Showing 24 of 26" in embed.description
     runner(tmp, with_cog_wrapper(t))
+
+
+def test_prompt_keeps_config_keys_and_button_ids_apart():
+    """The model kept writing `gen:<slug>:` for config keys because rule 5 uses that form for button IDs."""
+    p = builder.SYSTEM_PROMPT
+    assert "`gen_<slug>:`, with an UNDERSCORE" in p and "Never write `gen:<slug>:` for a config key" in p
+    assert "button IDs only" in p

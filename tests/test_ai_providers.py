@@ -433,3 +433,26 @@ def test_the_pinned_provider_is_restored_when_the_bot_restarts(monkeypatch):
             await db.pool.execute("DELETE FROM config WHERE key = $1", ai.PREFERRED_KEY)
             await db.close()
     asyncio.run(go())
+
+
+def test_connecting_has_its_own_short_limit_even_with_a_long_total_timeout(monkeypatch):
+    """An unreachable provider must be skipped in seconds: the code-writing timeout (240 s) only bounds the whole call."""
+    seen = []
+
+    class FakeResp:
+        status = 200
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def json(self, content_type=None): return {"choices": [{"message": {"content": "ok"}}]}
+
+    class FakeSession:
+        def post(self, url, **kw):
+            seen.append(kw["timeout"]); return FakeResp()
+        async def close(self): pass
+
+    async def t():
+        await ai.complete("s", "u", session=FakeSession(), timeout=240)
+        await ai.complete("s", "u", session=FakeSession(), timeout=5)
+        await ai.complete("s", "u", session=FakeSession(), timeout=0.2)
+    run(t())
+    assert [(x.total, x.connect) for x in seen] == [(240, ai.CONNECT_TIMEOUT_SECONDS), (5, 5), (0.2, 0.2)]

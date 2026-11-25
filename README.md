@@ -746,23 +746,43 @@ the AI service is down, tickets work exactly as normal. Turn it on with `/ai swi
 `AI_API_KEY` in `.env` (Gemini, Anthropic or any OpenAI-compatible service).
 
 **How it behaves (hybrid):**
-* On a new ticket Orion greets the member and answers the form from the **approved knowledge base** (`/ai kb add`). It only states facts
-  that are written there; if the knowledge base doesn't cover the question it says so and hands over to staff.
+* **Who it is:** Orion always presents itself as **Blue Heaven's personal assistant bot**. This is fixed in code (`orion/ai_brief.py`),
+  not a setting: it says plainly that it is an AI bot, never claims to be a person or staff, and ignores requests to play someone else.
+* On a new ticket Orion greets the member and answers the form from what it knows (next section). It only states facts that are written
+  there; if they don't cover the question it says so, hands over to staff, and records the question in `/ai gaps`.
 * It can ask a follow-up question, summarises the conversation for staff, and suggests a ticket category.
 * **Handover:** when the question is sensitive, the AI is unsure (below the confidence setting), it hit its reply limit, the member
   asks for a human, or the model's answer can't be read, Orion posts a fixed handover message with a summary and pings the staff
   roles for that ticket type. It then stays quiet. It also steps back the moment a staff member replies or claims the ticket.
 * **Never answered by the AI:** *Member Reports*, *Staff Applications* and *Partnerships* (change with `/ai set human-only-types`).
   Orion only greets and notifies staff there.
-* **Auto-close:** a routine ticket is closed automatically only after the member clearly confirms it is solved, the AI is confident, Orion
-  has already answered at least once, and no staff member has been involved. Members can reopen it (see below). `/ai set auto-close off`
-  disables it.
+* **Auto-close:** when the member says they are done (thanks, "that's all", "please close it"), Orion closes the ticket, saves the
+  transcript, and the member can reopen it (see below). Both the AI and a code check must agree: the member's last message must be short,
+  contain no question, and no "but / also / still / one more" style words. The AI must also be confident, have answered at least once, and
+  no staff member may have been involved. A "thanks" after the reply limit closes the ticket instead of handing it over.
+  `/ai set auto-close off` disables it.
 * **No powers:** the AI has no tools. It cannot ban, kick, punish, change roles or permissions, or delete anything. All it can do is
   send a message, hand over, or close a routine ticket. Member text is treated as data, so "ignore your rules" messages are ignored.
 
+**What Orion knows.** Three layers, all fed into every answer:
+1. **Live facts (automatic):** the ticket types and what each is for, the ticket timings, the realms, how XP is earned (the current
+   values from `/admin`), and the commands any member can use. Generated from Orion's own settings, so they are never out of date.
+2. **Core brief (you write it):** a short overview of Blue Heaven that Orion reads in *every* ticket. `/ai brief set` (up to 4,000 characters).
+3. **Knowledge entries (you write them):** rules, events, esports, giveaways, FAQs and so on. The ones that match the question are added to
+   that answer.
+
+The fastest way to fill layers 2 and 3 is one file: fill in `knowledge/blue_heaven_knowledge_template.md`, then run **`/ai kb import`** and
+attach it. A section that still contains `<<FILL IN>>` is skipped, so you can do it in several sittings. Importing again updates entries with
+the same title instead of duplicating them. `/ai kb export` downloads everything Orion knows as the same kind of file.
+
+**Teaching loop:** every time Orion is asked something its knowledge doesn't cover, it hands over to staff **and** records the question.
+`/ai gaps` lists them. Add the answers (`/ai kb add`, or edit the file and import it again) and the next member gets an answer.
+Orion never guesses: replies are checked against the three layers only. A mistake in the text you write there will be repeated as fact.
+
 **Admin controls** (`/ai`, Sect Admin only): `status`, `switch`, `set` (tone, length, personality, confidence, auto-close, max-replies,
-ping-staff, model, human-only-types), `kb add | edit | list | toggle | remove`, `logs [ticket]`, `test <question>`. Staff can switch it for
-one ticket with `/ticket ai on|off`. Every AI action is recorded (`/ai logs`), and settings changes go to the audit log.
+ping-staff, model, human-only-types), `brief set | show`, `kb add | edit | list | toggle | remove | import | export`, `gaps`,
+`logs [ticket]`, `test <question>`. Staff can switch it for one ticket with `/ticket ai on|off`. Every AI action is recorded (`/ai logs`),
+and settings changes go to the audit log.
 
 ### Reopening and retention
 

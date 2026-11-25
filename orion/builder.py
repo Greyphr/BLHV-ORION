@@ -286,14 +286,15 @@ HARD RULES
 2. Database: use only tables you create yourself, named `gen_<slug>` or starting with `gen_<slug>_` (<slug> is your SLUG). \
 Put the CREATE statements in the SCHEMA section, not in the code: only `CREATE TABLE IF NOT EXISTS` and \
 `CREATE [UNIQUE] INDEX IF NOT EXISTS` for your own tables. The harness runs the SCHEMA once, after a backup, before your \
-code loads. Never read or write any other table. Config keys you set with bot.db.set must start with `gen_<slug>:`.
+code loads. Never read or write any other table. Config keys you set with bot.db.set (and alert keys) must start with \
+`gen_<slug>:`, with an UNDERSCORE after `gen` (for example `gen_<slug>:channel_id`). Never write `gen:<slug>:` for a config key.
 3. Never read environment variables or the bot token, never run shell commands or subprocesses, never make network \
 requests, never use eval/exec/__import__, never write files.
 4. Slash commands: use discord.app_commands inside a commands.Cog. Never reuse an existing command name (list below). \
 Commands that change the server (create channels/roles, post panels, change settings) must be restricted with \
 `@app_commands.check(require_admin)`.
 5. Buttons, selects and modals that must keep working after a restart: views with timeout=None, every item given a fixed \
-custom_id that starts with `gen:<slug>:`, registered in `cog_load` with `self.bot.add_view(...)` (or \
+custom_id that starts with `gen:<slug>:` (button IDs only, with a COLON after `gen`; config keys are different, see rule 2), registered in `cog_load` with `self.bot.add_view(...)` (or \
 `self.bot.add_dynamic_items(...)`). Undo that in `cog_unload` (view.stop()).
 6. Be idempotent: running a setup command twice must not create duplicate roles or channels. Look the thing up by stored ID, \
 then by name, before creating it, and store IDs in your own table or `gen_<slug>:` config keys.

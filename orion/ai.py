@@ -24,6 +24,8 @@ from . import config
 log = logging.getLogger("orion.ai")
 
 TIMEOUT_SECONDS = 25
+CONNECT_TIMEOUT_SECONDS = 15     # opening the connection (DNS + TCP + TLS) must finish in this long, however big `timeout` is:
+                                 # an unreachable provider is skipped in seconds instead of after the full 240 s code-writing wait
 MAX_REPLY_CHARS = 900            # the answer is one short paragraph; Discord allows 2000 per message
 MAX_INPUT_CHARS = 3000
 KINDS = ("gemini", "anthropic", "openai")
@@ -202,7 +204,9 @@ def clean_reply(text: str, limit: int = MAX_REPLY_CHARS) -> str:
 # --------------------------------------------------------------------------- one provider
 async def _post(session: aiohttp.ClientSession, p: Provider, url: str, headers: dict, body: dict, timeout: float):
     try:
-        async with session.post(url, json=body, headers=headers, timeout=aiohttp.ClientTimeout(total=timeout)) as r:
+        # `total` is the whole call; `connect` is only the time to reach the service, so a dead network fails fast
+        limits = aiohttp.ClientTimeout(total=timeout, connect=min(CONNECT_TIMEOUT_SECONDS, timeout))
+        async with session.post(url, json=body, headers=headers, timeout=limits) as r:
             if r.status != 200:
                 detail = (await r.text())[:200]
                 for k in {p.key, *(q.key for q in chain()[0])}:      # never echo any configured key, even another provider's
@@ -271,7 +275,8 @@ async def complete(system: str, user: str, max_tokens: int = 400, session: aioht
 
     `model` names a model for the MAIN provider only (fallbacks use their own). json_mode asks the provider for JSON where it
     supports that; raw=True returns the text untouched (for JSON), otherwise it is cleaned and capped like a chat message.
-    `timeout` overrides the 25 s default (code writing needs longer). `only` asks just that provider, with no fallback and no
+    `timeout` overrides the 25 s default (code writing needs longer); connecting is always capped at CONNECT_TIMEOUT_SECONDS.
+    `only` asks just that provider, with no fallback and no
     retry (for /ai provider test)."""
     providers, problems = chain()
     if only is not None:

@@ -57,6 +57,10 @@ class AiStore:
                                          ticket_id, limit)
         return await self.pool.fetch("SELECT * FROM ai_logs ORDER BY id DESC LIMIT $1", limit)
 
+    async def ai_gap_logs(self, limit: int = 15):
+        """Questions the AI could not answer from the approved information (newest first): what staff should teach it next."""
+        return await self.pool.fetch("SELECT * FROM ai_logs WHERE kind='gap' ORDER BY id DESC LIMIT $1", limit)
+
     async def ai_stats(self, days: int = 7) -> dict:
         rows = await self.pool.fetch(
             "SELECT kind, COUNT(*) AS n FROM ai_logs WHERE created_at > now() - make_interval(days => $1) GROUP BY kind",
